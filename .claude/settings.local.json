@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\Supermarket\\\\db_schema.py' 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\sunshine_v2\\\\db_schema.py')",
+      "Bash(cp 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\Supermarket\\\\api_v2.py' 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\sunshine_v2\\\\api_v2.py')",
+      "Bash(cp 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\Supermarket\\\\ARCHITECTURE.md' 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\sunshine_v2\\\\ARCHITECTURE.md')",
+      "Bash(pip show *)",
+      "Bash(pip install *)",
+      "Bash(cp 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\Supermarket\\\\orders.db' 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\sunshine_v2\\\\orders.db')",
+      "Bash(cp 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\Supermarket\\\\products.xlsx' 'C:\\\\Users\\\\Administrator\\\\Desktop\\\\sunshine_v2\\\\products.xlsx')",
+      "Bash(python db_schema.py)",
+      "Bash(pkill -f \"uvicorn api_v2\")",
+      "Bash(start /B python -m uvicorn api_v2:app --host 0.0.0.0 --port 8503 --reload)",
+      "Bash(python -m uvicorn api_v2:app --host 127.0.0.1 --port 8503 --reload)",
+      "Bash(curl -s http://127.0.0.1:8503/api/v2/health)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

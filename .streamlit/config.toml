@@ -1,0 +1,8 @@
+# Streamlit UI — https://docs.streamlit.io/develop/api-reference/configuration/config.toml
+#
+# Why you saw “Stop” / ⋮ on the top-right: localhost opens in “developer” toolbar
+# mode (rerun, stop, settings). Below hides those for a cleaner look for operators.
+# Developers: comment out or set to "auto" / "developer" when you need Stop / debug.
+
+[client]
+toolbarMode = "viewer"

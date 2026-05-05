@@ -1,0 +1,3 @@
+gemini.env
+__pycache__/
+*.pyc

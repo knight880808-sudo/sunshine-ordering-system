@@ -1,0 +1,44 @@
+{
+  "enabled": true,
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user": "knight880808@gmail.com",
+  "smtp_password": "ktdk gvsf mqef maot",
+  "from_addr": "knight880808@gmail.com",
+  "use_tls": true,
+  "events": {
+    "new_order": {
+      "enabled": true,
+      "to": [
+        "sunshine.it2026@outlook.com"
+      ]
+    },
+    "dispatched": {
+      "enabled": true,
+      "to": [
+        "sunshine.it2026@outlook.com"
+      ]
+    },
+    "shortage": {
+      "enabled": true,
+      "to": [
+        "sunshine.it2026@outlook.com"
+      ]
+    },
+    "supplier_order": {
+      "enabled": true,
+      "to": [
+        "sunshine.it2026@outlook.com"
+      ]
+    }
+  },
+  "branch_emails": {
+    "NAMBER ONE STORE": "sunshine.it2026@outlook.com",
+    "SUNSHINE MARKET": "sunshine.it2026@outlook.com",
+    "SUNSHINE PS": "sunshine.it2026@outlook.com",
+    "SUNSHINE FU-SANMA": "sunshine.it2026@outlook.com",
+    "SUNSHINE FU-NEMO": "sunshine.it2026@outlook.com",
+    "CHEN STORE-SARAKATA": "sunshine.it2026@outlook.com",
+    "CHEN STORE-CHAPI": "sunshine.it2026@outlook.com"
+  }
+}

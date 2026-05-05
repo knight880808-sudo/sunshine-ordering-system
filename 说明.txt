@@ -1,0 +1,38 @@
+Supermarket 拆分目录说明
+========================
+
+1. 目录结构（与约定一致）
+   - app.py              入口，仅调用 sunmarket_bundle.main()
+   - config.py           配置常量（切片）
+   - database.py         数据库 DDL / 连接（切片）
+   - auth.py             会话、浏览器历史、登录页（切片）
+   - router.py           route()（切片）
+   - app_main.py         main()（切片）
+   - views/              分店 / 仓库 / 管理员界面与导航（切片）
+   - modules/            备份、邮件、商品、导出、通用工具（切片）
+   - ui/                 全局 CSS 与通用 UI 组件（切片）
+
+2. 如何运行
+   在本文件夹内执行：
+     pip install -r requirements.txt
+     streamlit run app.py --server.port 8502 --server.address 0.0.0.0
+
+   请将 products.xlsx、orders.db（若已有）、images/、gemini.env 等放在本目录，
+   或保持与工作目录一致（与原单文件 app 相同）。
+
+3. 切片与合并
+   - 真实可执行逻辑集中在 sunmarket_bundle.py（由脚本拼接，请勿手改）。
+   - 修改业务时：编辑某切片文件（如 views/branch.py）后，务必运行：
+       python build_bundle.py
+     以重新生成 sunmarket_bundle.py。
+   - build_bundle.py 默认读取：
+       C:\Users\Administrator\Desktop\Supermarket\app.py
+     若源文件路径变更，请编辑 build_bundle.py 顶部 SOURCE。
+
+4. 为何保留 bundle
+   - 原 app 约 9000+ 行，模块间调用极多；一次性改成纯 import 链容易循环依赖。
+   - 当前方案：目录中的 py 文件对应「物理拆分 + 可读边界」；
+     运行仍用一份合并模块，保证行为与原版一致。
+
+5. 后续可做
+   - 逐块把 sunmarket_bundle 中的符号改为跨文件 import，最终删除 bundle。

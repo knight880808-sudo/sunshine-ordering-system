@@ -1,0 +1,6 @@
+export { CheckoutModal } from './components/CheckoutModal'
+export { CheckoutTrigger } from './components/CheckoutTrigger'
+export { useOrderCheckout } from './hooks/useOrderCheckout'
+export { paymentLabel } from './paymentLabels'
+export { simulateReceiptPrint } from './lib/simulateReceiptPrint'
+export type { Order, PaymentMethod } from './types'
