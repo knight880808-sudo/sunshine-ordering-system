@@ -1,3 +1,8 @@
 gemini.env
 __pycache__/
 *.pyc
+orders.db
+backups/*.db
+app_runtime.log
+email_log.json
+~$products.xlsx

@@ -11,24 +11,26 @@ from __future__ import annotations
 import html
 import io
 import hashlib
+import hmac
 import json
 import os
 import re
 import smtplib
 import sqlite3
-import socket
 import ssl
 import threading
 import traceback
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -37,7 +39,110 @@ from openpyxl.utils import get_column_letter
 # CONFIG / CONSTANTS
 # =========================================================================
 DB_PATH = Path("orders.db")
+
+
+@dataclass
+class ExcelSheetImportOutcome:
+    """Excel 批量导入结果（价格 / 库存共用结构）。
+
+    - n_written：实际写入数据库（或产生库存流水）的行数
+    - n_skipped_benign：不构成错误、有意跳过的行（如数量为 0、价格与库内一致）
+    - n_failed：无法处理或处理报错的行数
+    """
+
+    n_written: int = 0
+    n_skipped_benign: int = 0
+    n_failed: int = 0
+    failure_messages: list[str] = field(default_factory=list)
+
+    @property
+    def n_ok(self) -> int:
+        """界面「成功」：已生效的变更条数（与 n_written 一致）。"""
+        return int(self.n_written)
+
+
+def _import_row_ref(sheet_row: int, item_code: str, barcode: str, name: str) -> str:
+    bits: list[str] = []
+    nm = (name or "").strip()
+    if nm:
+        bits.append(nm[:48])
+    ic = (item_code or "").strip()
+    if ic:
+        bits.append(f"编号:{ic}")
+    bc = (barcode or "").strip()
+    if bc:
+        bits.append(f"条码:{bc}")
+    label = " · ".join(bits) if bits else "（空行/无标识）"
+    return f"表第 {sheet_row} 行 · {label}"
+
+
+def _df_row_is_blank_catalog_row(row: pd.Series) -> bool:
+    ic = str(row.get("ItemCode", "") or "").strip()
+    bc = str(row.get("Barcode", "") or "").strip()
+    nm = str(row.get("Name", "") or "").strip()
+    return not ic and not bc and not nm
 PRODUCTS_PATH = Path("products.xlsx")
+
+
+def products_master_excel_path() -> Path:
+    """商品主数据文件路径。
+
+    优先使用根目录下「商品档案_*.xlsx」中**修改时间最新**的一份（例如
+    商品档案_260506_080011.xlsx）；若不存在则回退到 products.xlsx。
+    仓库保存/清空主数据时与读取使用同一路径，避免新旧两套表打架。"""
+    root = Path(".")
+    candidates = sorted(
+        root.glob("商品档案_*.xlsx"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        return candidates[0]
+    return PRODUCTS_PATH
+
+
+def _normalize_product_sheet_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """将常见中文列名映射为 ItemCode / Barcode / Name，便于后续统一解析。"""
+    if df is None or df.empty:
+        return df
+    col_by_lower = {
+        str(c).replace("\ufeff", "").strip().lower(): c for c in df.columns
+    }
+
+    def _has(canonical: str) -> bool:
+        return canonical in df.columns
+
+    def _first_alias(cands: list[str]) -> str | None:
+        for cand in cands:
+            orig = col_by_lower.get(cand.strip().lower())
+            if orig is not None:
+                return orig
+        return None
+
+    renames: dict[str, str] = {}
+    if not _has("ItemCode"):
+        hit = _first_alias(
+            ["商品编号", "货号", "编号", "内部编号", "sku", "itemcode", "item_code"]
+        )
+        if hit:
+            renames[hit] = "ItemCode"
+    if not _has("Barcode"):
+        hit = _first_alias(
+            ["条码", "商品条码", "条形码", "barcode", "ean", "upc"]
+        )
+        if hit:
+            renames[hit] = "Barcode"
+    if not _has("Name"):
+        hit = _first_alias(["商品名称", "名称", "品名", "name", "description"])
+        if hit:
+            renames[hit] = "Name"
+    if renames:
+        df = df.rename(columns=renames)
+    return df
+
+# In-app page id for the browser address bar — enables mobile back/forward
+# between sidebar “pages” via the History API (parent window, not the iframe).
+URL_PAGE_QUERY_KEY = "p"
 
 # Product image folder. File naming convention (in priority order):
 #   images/<ItemCode>.<ext>   e.g. images/P001.jpg
@@ -133,6 +238,46 @@ BRANCHES: list[str] = [
 
 WAREHOUSE_PASSWORD = os.getenv("SUNSHINE_WAREHOUSE_PASSWORD", "sunshine888")
 ADMIN_PASSWORD = os.getenv("SUNSHINE_ADMIN_PASSWORD", "sunshine")
+# 管理员手机号（可选）：设置后，管理员登录须同时校验手机号与密码。支持多个号码用英文逗号分隔。
+# Comma-separated mobile numbers; when set, admin login requires matching phone + password.
+ADMIN_PHONE_ENV = os.getenv("SUNSHINE_ADMIN_PHONE", "").strip()
+
+
+def _normalize_phone_digits(raw: str) -> str:
+    return re.sub(r"\D+", "", (raw or "").strip())
+
+
+def _admin_phone_allowlist() -> set[str]:
+    if not ADMIN_PHONE_ENV:
+        return set()
+    return {
+        p for p in (_normalize_phone_digits(x) for x in ADMIN_PHONE_ENV.split(","))
+        if p
+    }
+
+# Branch account permission codes (JSON stored per user; admin can grant subsets).
+BRANCH_PERM_ORDER: list[tuple[str, str]] = [
+    ("order", "perm_order"),
+    ("my_orders", "perm_my_orders"),
+    ("my_short", "perm_my_short"),
+    ("messages", "perm_messages"),
+    ("ai", "perm_ai"),
+]
+BRANCH_PERM_CODES: tuple[str, ...] = tuple(p for p, _ in BRANCH_PERM_ORDER)
+
+ACCOUNT_STATUS_PENDING = "pending"
+ACCOUNT_STATUS_APPROVED = "approved"
+ACCOUNT_STATUS_REJECTED = "rejected"
+
+AUDIT_EVENT_TYPES: tuple[str, ...] = (
+    "login",
+    "logout",
+    "order_submit",
+    "receive_confirm",
+    "supplier_order",
+    "catalog_reset",
+    "catalog_save",
+)
 
 
 class Role:
@@ -173,12 +318,179 @@ T: dict[str, dict[str, str]] = {
     "login":          {"en": "Login",                    "zh": "登录"},
     "logout":         {"en": "Logout",                   "zh": "退出登录"},
     "wrong_pw":       {"en": "Wrong password",           "zh": "密码错误"},
+    "admin_phone":    {"en": "Admin mobile number",      "zh": "管理员手机号"},
+    "wrong_phone":    {"en": "Phone number not authorized",
+                        "zh": "手机号未授权"},
+    "admin_login_phone_hint": {
+        "en": "Enter the mobile number configured for `SUNSHINE_ADMIN_PHONE` (server env).",
+        "zh": "请输入服务器上 `SUNSHINE_ADMIN_PHONE` 环境变量中配置的管理员手机号。",
+    },
+    "nav_accounts":   {"en": "👤 Accounts & access",     "zh": "👤 账号与权限"},
+    "nav_audit_log":  {"en": "📜 Audit log",            "zh": "📜 操作日志"},
+    "audit_log_subtitle": {
+        "en": "Login, orders, and receipt confirmations — filter by time, branch, or order.",
+        "zh": "记录登录、下单、收货确认等操作，可按时间、分店、订单号筛选。",
+    },
+    "audit_filter_from": {"en": "From date",             "zh": "开始日期"},
+    "audit_filter_to":   {"en": "To date",               "zh": "结束日期"},
+    "audit_filter_events": {"en": "Event types",         "zh": "事件类型"},
+    "audit_filter_branch": {"en": "Branch",              "zh": "分店"},
+    "audit_filter_order": {"en": "Order ID contains",    "zh": "订单号包含"},
+    "audit_filter_user": {"en": "Username contains",    "zh": "用户名包含"},
+    "audit_export_csv": {"en": "Download CSV",         "zh": "导出 CSV"},
+    "audit_no_rows":    {"en": "No matching records.",  "zh": "没有符合条件的记录。"},
+    "audit_col_time":   {"en": "Time",                  "zh": "时间"},
+    "audit_col_event":  {"en": "Event",                "zh": "事件"},
+    "audit_col_role":   {"en": "Role",                 "zh": "角色"},
+    "audit_col_account": {"en": "Account ID",          "zh": "账号ID"},
+    "audit_col_user":   {"en": "Username",             "zh": "用户"},
+    "audit_col_branch": {"en": "Branch",               "zh": "分店"},
+    "audit_col_order":  {"en": "Order ID",             "zh": "订单号"},
+    "audit_col_detail": {"en": "Detail",               "zh": "详情"},
+    "audit_d_shared_login": {
+        "en": "Shared password login ({role})",
+        "zh": "共享密码登录（{role}）",
+    },
+    "audit_d_branch_login": {
+        "en": "Branch account login · account ID {id}",
+        "zh": "分店账号登录 · 账号 ID {id}",
+    },
+    "audit_d_logout_page": {
+        "en": "Last screen before logout: {page}",
+        "zh": "退出前所在页面：{page}",
+    },
+    "audit_d_line_count": {
+        "en": "{n} item line(s)",
+        "zh": "共 {n} 行商品明细",
+    },
+    "audit_d_has_short": {
+        "en": "Receipt had shortage reported",
+        "zh": "收货上报缺货",
+    },
+    "audit_d_no_short": {
+        "en": "Receipt matched dispatch (no shortage)",
+        "zh": "实收与发货一致（未报缺货）",
+    },
+    "audit_d_supplier_title": {
+        "en": "Title: {title}",
+        "zh": "标题：{title}",
+    },
+    "audit_d_supplier_lines": {
+        "en": "{n} SKU line(s)",
+        "zh": "订货 {n} 行",
+    },
+    "audit_ev_login":   {"en": "Login",                "zh": "登录"},
+    "audit_ev_logout":  {"en": "Logout",               "zh": "登出"},
+    "audit_ev_order":   {"en": "Place order",          "zh": "提交订单"},
+    "audit_ev_receive": {"en": "Confirm receipt",      "zh": "确认收货"},
+    "audit_ev_supplier": {"en": "Supplier order sent", "zh": "供货商下单已发送"},
+    "audit_ev_catalog_reset": {"en": "Catalog wipe", "zh": "清空商品资料"},
+    "audit_ev_catalog_save": {"en": "Shelf catalog save", "zh": "货架录入保存"},
+    "audit_all_branches": {"en": "All branches",      "zh": "全部分店"},
+    "acct_tab_login": {"en": "Account login",            "zh": "账号登录"},
+    "acct_tab_apply": {"en": "Request an account",       "zh": "申请账号"},
+    "acct_login_hint": {"en": "Log in with the username and password issued after admin approval.",
+                        "zh": "请使用管理员审批通过后的用户名与密码登录。"},
+    "acct_username":  {"en": "Username",                 "zh": "用户名"},
+    "acct_display_name": {"en": "Display name",          "zh": "姓名/备注名"},
+    "acct_phone":     {"en": "Phone (optional)",       "zh": "手机号（选填）"},
+    "acct_password":  {"en": "Password",                 "zh": "密码"},
+    "acct_password2": {"en": "Confirm password",         "zh": "确认密码"},
+    "acct_apply_submit": {"en": "Submit application",   "zh": "提交申请"},
+    "acct_apply_ok":  {"en": "Application received. An administrator must approve and grant access before you can use the system.",
+                        "zh": "申请已提交。需由管理员审批并授权后，方可使用系统功能。"},
+    "acct_apply_done_title": {"en": "Application submitted", "zh": "申请已提交"},
+    "acct_back_branch_options": {"en": "Back to branch sign-in", "zh": "返回分店登录"},
+    "acct_enter_store_title": {"en": "Enter your store", "zh": "进入门店"},
+    "acct_enter_store_hint": {
+        "en": "Select your store first. Login and account requests apply only to this store.",
+        "zh": "请先选择您所在的门店。登录与申请账号仅针对当前门店，不可跨店使用。",
+    },
+    "acct_current_store": {"en": "Current store", "zh": "当前门店"},
+    "acct_change_store": {"en": "Change store", "zh": "更换门店"},
+    "acct_wrong_branch": {
+        "en": "This account belongs to another store. Change store above or use the correct account.",
+        "zh": "该账号不属于当前门店。请更换门店或使用对应门店的账号登录。",
+    },
+    "acct_apply_dup": {"en": "This username is already taken or you already have a pending/approved request.",
+                        "zh": "该用户名已存在，或您已有待审/已通过的申请。"},
+    "acct_user_invalid": {"en": "Use 3–32 characters: letters, numbers, underscore only.",
+                          "zh": "用户名需 3–32 位，仅字母、数字、下划线。"},
+    "acct_pw_short":  {"en": "Password must be at least 6 characters.",
+                        "zh": "密码至少 6 位。"},
+    "acct_pw_mismatch": {"en": "The two passwords do not match.",
+                          "zh": "两次输入的密码不一致。"},
+    "acct_branch_invalid": {"en": "Invalid branch.", "zh": "分店无效。"},
+    "acct_pending_login": {"en": "This account is waiting for administrator approval.",
+                          "zh": "该账号正在等待管理员审批。"},
+    "acct_rejected_login": {"en": "This application was not approved. Contact your administrator.",
+                            "zh": "该申请未通过，请联系管理员。"},
+    "acct_no_access": {"en": "You do not have permission for this page.",
+                       "zh": "您没有权限访问此页面。"},
+    "acct_perm_need_admin": {"en": "No module permission assigned yet. Ask an administrator to grant access.",
+                             "zh": "尚未分配任何功能权限，请联系管理员授权。"},
+    "perm_order":     {"en": "Place orders",             "zh": "下单"},
+    "perm_my_orders": {"en": "My orders",              "zh": "我的订单"},
+    "perm_my_short":  {"en": "My shortages",           "zh": "我的缺货"},
+    "perm_messages":  {"en": "Messages",               "zh": "消息中心"},
+    "perm_ai":        {"en": "AI assistant",           "zh": "AI 助手"},
+    "acct_pending_hdr": {"en": "Pending applications", "zh": "待审批申请"},
+    "acct_approved_hdr": {"en": "Approved accounts", "zh": "已开通账号"},
+    "acct_status":    {"en": "Status",                 "zh": "状态"},
+    "acct_created":   {"en": "Submitted",              "zh": "提交时间"},
+    "acct_actions":   {"en": "Actions",                "zh": "操作"},
+    "acct_approve":   {"en": "Approve & set permissions", "zh": "批准并授权"},
+    "acct_reject":    {"en": "Reject",                 "zh": "拒绝"},
+    "acct_save_perms": {"en": "Save permissions",      "zh": "保存权限"},
+    "acct_reset_pw":  {"en": "New password",           "zh": "新密码"},
+    "acct_pw_apply":  {"en": "Update password",        "zh": "更新密码"},
+    "acct_create_user": {"en": "Create account directly", "zh": "直接创建账号"},
+    "acct_note_reject": {"en": "Reason (optional)",    "zh": "备注（选填）"},
+    "acct_perms_pick":  {"en": "Allowed modules",      "zh": "可用功能模块"},
+    "acct_updated":     {"en": "Saved.",               "zh": "已保存。"},
+    "st_pending_acct": {"en": "Pending",               "zh": "待审批"},
+    "st_approved_acct": {"en": "Approved",              "zh": "已通过"},
+    "st_rejected_acct": {"en": "Rejected",              "zh": "已拒绝"},
     # Nav
     "nav_order":      {"en": "🛒 Place Order",           "zh": "🛒 下单"},
     "nav_my_orders":  {"en": "📋 My Orders",             "zh": "📋 我的订单"},
     "nav_my_short":   {"en": "🔔 My Shortages",          "zh": "🔔 我的缺货"},
     "nav_pending":    {"en": "📦 Pending Dispatch",      "zh": "📦 待发货订单"},
     "nav_short_in":   {"en": "🔔 Shortage Notifications","zh": "🔔 缺货通知"},
+    "nav_supplier_order": {"en": "🏭 Order from supplier", "zh": "🏭 向供货商下单"},
+    "wh_supplier_subtitle": {
+        "en": "Fill in what to order from the supplier. It will be sent to admin message center and configured email addresses.",
+        "zh": "填写向供货商采购的内容。提交后将推送到管理员消息中心，并邮件通知在「邮件通知」中配置的收件人。",
+    },
+    "wh_supplier_subject": {"en": "Title / subject",     "zh": "标题/主题"},
+    "wh_supplier_details": {
+        "en": "Order lines (select products)",
+        "zh": "订货明细（选择商品）",
+    },
+    "wh_supplier_pick": {"en": "Product", "zh": "选择商品"},
+    "wh_supplier_add_line": {"en": "Add to order", "zh": "加入订货单"},
+    "wh_supplier_search_hint": {
+        "en": "Enter keywords to search the catalog.",
+        "zh": "请输入关键词搜索商品。",
+    },
+    "wh_supplier_search_commit_hint": {
+        "en": "Type a code or keyword, then click **Search** or press **Enter** in the field to load matches (Streamlit does not search while typing).",
+        "zh": "输入编号或关键词后，请点击「搜索」，或在输入框内按 **Enter** 确认后再显示结果（仅输入不确认不会刷新列表）。",
+    },
+    "wh_supplier_cart": {"en": "Current order lines", "zh": "当前订货明细"},
+    "wh_supplier_remove": {"en": "Remove", "zh": "移除"},
+    "wh_supplier_send":   {"en": "Send",                 "zh": "发送"},
+    "wh_supplier_need_lines": {"en": "Please add at least one product line.",
+                                "zh": "请至少添加一行商品。"},
+    "wh_supplier_default_subj": {"en": "Supplier restock",
+                                  "zh": "供货商订货"},
+    "wh_supplier_done_title": {"en": "Message sent",     "zh": "信息已发送"},
+    "wh_supplier_done_msg": {
+        "en": "Your supplier order request has been delivered to administrators and the configured email recipients.",
+        "zh": "您的供货商下单信息已提交至管理员消息中心，并已按设置发送邮件。",
+    },
+    "wh_supplier_back": {"en": "New request",            "zh": "继续下单"},
+    "wh_notif_inbox_title": {"en": "Supplier order",     "zh": "供货商下单"},
     "nav_dashboard":  {"en": "📊 Dashboard",              "zh": "📊 管理概览"},
     "nav_all_orders": {"en": "📋 All Orders",             "zh": "📋 所有订单"},
     "nav_dispatch":   {"en": "📦 Dispatch",               "zh": "📦 出库发货"},
@@ -187,6 +499,29 @@ T: dict[str, dict[str, str]] = {
     "nav_messages":   {"en": "🔔 Messages",               "zh": "🔔 消息中心"},
     "nav_arrivals":   {"en": "📦 Stock Arrivals",         "zh": "📦 进货通知"},
     "nav_inventory":  {"en": "📦 Inventory",              "zh": "📦 库存管理"},
+    "nav_shelf_mobile": {"en": "📱 Shelf (mobile)",      "zh": "📱 货架录入（手机）"},
+    "shelf_mobile_subtitle": {
+        "en": "Enter products on the shelf: name, price, pieces per carton, and stock. "
+              "For a full reset, use the danger zone on this page (clears database stock and the catalog file).",
+        "zh": "在货架边用手机录入：商品名称、价格、每箱个数、库存等。需要彻底清空时，请使用本页「危险操作」"
+              "（会删除数据库中的商品库存与价格覆盖，并重置商品表文件）。",
+    },
+    "shelf_pcs_per_carton": {"en": "Pcs / carton",        "zh": "每箱个数"},
+    "shelf_wipe_title":   {"en": "Danger: clear all products & stock", "zh": "危险：清空全部商品与库存"},
+    "shelf_wipe_blurb":   {
+        "en": "Deletes `products.xlsx` contents, all inventory rows, price overrides, and inventory history. "
+              "Does not delete past orders. Type the confirmation text to enable the button.",
+        "zh": "将清空 `products.xlsx` 中的商品、数据库内全部库存、价格覆盖与库存流水。不会删除历史订单。输入确认文字后才会启用按钮。",
+    },
+    "shelf_wipe_confirm": {"en": "Type: CLEAR",            "zh": "输入确认：清空"},
+    "shelf_wipe_ok":     {"en": "Wipe complete",         "zh": "已清空"},
+    "shelf_save_ok":     {"en": "Catalog saved",         "zh": "商品资料已保存"},
+    "shelf_need_name":   {"en": "Each row must have a product name.", "zh": "每一行必须填写商品名称。"},
+    "shelf_save_btn":    {"en": "Save to catalog & sync stock", "zh": "保存到商品表并同步库存"},
+    "shelf_editor_hint": {
+        "en": "Add rows as you walk the aisle. Barcode and code are optional if unknown.",
+        "zh": "沿货架逐行添加；不清楚条码或编号可先留空。",
+    },
     # Statuses
     "st_pending":     {"en": "Pending",                  "zh": "待发货"},
     "st_dispatched":  {"en": "Dispatched",               "zh": "已发货"},
@@ -208,22 +543,16 @@ T: dict[str, dict[str, str]] = {
     "barcode":        {"en": "Barcode",                  "zh": "条码"},
     "cartons":        {"en": "Cartons",                  "zh": "箱数"},
     "each_pcs":       {"en": "Each pcs",                 "zh": "个数"},
+    "order_qty_heading": {"en": "Order quantity",       "zh": "订货数量"},
     "qty_cartons":    {"en": "Cartons",                  "zh": "箱"},
     "qty_pcs":        {"en": "Pcs",                      "zh": "个"},
     "add_to_cart":    {"en": "Add to Cart",              "zh": "加入购物车"},
     "cart":           {"en": "Cart",                     "zh": "购物车"},
     "empty_cart":     {"en": "Cart is empty",            "zh": "购物车为空"},
-    "branch_product_col_name": {
-        "en": "NAME / Product name",
-        "zh": "NAME / 商品名",
-    },
-    "branch_product_col_brocode": {"en": "BROCODE", "zh": "BROCODE"},
-    "branch_product_col_price_label": {
-        "en": "PRICE / Price",
-        "zh": "PRICE / 价格",
-    },
-    "branch_product_value_empty": {"en": "—", "zh": "—"},
-    "price":          {"en": "Price",                    "zh": "价格"},
+    "branch_cart_sync_tip":
+        {"en": "Your draft cart is saved to this account and comes back "
+               "after a refresh or switching away from the browser.",
+               "zh": "购物车草稿保存在本账号，刷新页面或从其他应用返回浏览器后会自动恢复。"},
     "submit_order":   {"en": "Submit Order",             "zh": "提交订单"},
     "order_submitted":{"en": "Order submitted",          "zh": "订单已提交"},
     "order_sent_done":{"en": "Order has been sent successfully",
@@ -293,6 +622,22 @@ T: dict[str, dict[str, str]] = {
                         "zh": "说明文档: https://ai.google.dev/gemini-api/docs/rate-limits · 用量: https://ai.dev/rate-limit"},
     "ai_quota_actions": {"en": "Actions: wait a few minutes and retry; enable billing in Google AI Studio; or set GEMINI_MODEL / GEMINI_FALLBACK_MODELS to a model your plan supports.",
                         "zh": "处理建议：等待几分钟后重试；在 Google AI Studio 为项目开通计费/提高配额；或在环境变量中设置 GEMINI_MODEL、GEMINI_FALLBACK_MODELS 为你账号可用的模型。"},
+    "ai_key_leaked_403": {
+        "en": "This Gemini API key was rejected (HTTP 403): Google reports it as leaked or revoked. It cannot be used anymore.",
+        "zh": "当前 Gemini API 密钥已被拒绝（HTTP 403）：Google 判定该密钥已泄露或已被停用，无法继续使用。",
+    },
+    "ai_key_leaked_actions": {
+        "en": "Create a **new** API key in Google AI Studio → delete/disable the old key → set `GEMINI_API_KEY` (environment) or edit `gemini.env` next to `app.py`, then restart the app. Never commit API keys to Git or share them in chat/screenshots.",
+        "zh": "请在 [Google AI Studio](https://aistudio.google.com/apikey) **重新创建**密钥，并在控制台**删除/停用**旧密钥；在本机设置环境变量 `GEMINI_API_KEY`，或修改与 `app.py` 同目录的 `gemini.env`，然后**重启** Streamlit。切勿把密钥提交到 Git、聊天或截图外传。",
+    },
+    "ai_key_invalid_400": {
+        "en": "The Gemini API key is not accepted (HTTP 400: API_KEY_INVALID). It may be wrong, copied with extra spaces, disabled, or for a different Google project.",
+        "zh": "当前 Gemini API 密钥无效（HTTP 400）：可能被删除/复制错误、前后有空格、与 Google 项目不匹配，或环境变量里仍是旧值。",
+    },
+    "ai_key_invalid_actions": {
+        "en": "1) In [AI Studio](https://aistudio.google.com/apikey) create a new key and enable **Generative Language API** for the project. 2) Set `GEMINI_API_KEY` in `gemini.env` (next to `app.py`) on **one line** with no spaces around `=`, or set the Windows user env var. 3) If both exist, **Windows env wins** — update or remove the old one. 4) **Fully restart** the Streamlit process (not just refresh the browser).",
+        "zh": "1）打开 [Google AI Studio](https://aistudio.google.com/apikey) 新建 API 密钥，并确认已对该 Google 项目启用 **Generative Language API**。2）在 `app.py` 同目录的 `gemini.env` 中写 `GEMINI_API_KEY=新密钥`（等号两侧不要多余空格、不要加引号），或只改 Windows 用户环境变量。3）若同时存在**系统/用户环境变量**与 `gemini.env`，会**优先用环境变量** —— 请同步更新或删除旧的环境变量。4）改完后**完全退出并重新启动** Streamlit 进程，不要只刷新网页。",
+    },
     "ai_model_used":   {"en": "(Answered with backup model: {model})",
                         "zh": "（已使用备用模型回答：{model}）"},
     "ai_ctx_role":     {"en": "Current role",             "zh": "当前角色"},
@@ -329,6 +674,34 @@ T: dict[str, dict[str, str]] = {
     "arrival_none":   {"en": "No active arrival notice",  "zh": "当前暂无生效到货通知"},
     "arrival_priority_tip": {"en": "New stock is available. Prioritize ordering these items.",
                              "zh": "有新货到达，请优先下单以下商品。"},
+    "arrival_publish_hint_dialog": {
+        "en": "Click the button below to open a window, search and tick products, then confirm — lines are appended to the list.",
+        "zh": "点击下方按钮，在弹出窗口中搜索并勾选商品，确认后将自动写入下方「到货商品清单」。",
+    },
+    "arrival_pick_open_btn": {
+        "en": "Pick products (popup)",
+        "zh": "选择商品并追加到清单",
+    },
+    "arrival_pick_dialog_hint": {
+        "en": "Search or scroll the list, tick products, then confirm.",
+        "zh": "在窗口内搜索或浏览列表，勾选商品后点「确认追加」。",
+    },
+    "arrival_pick_dialog_select": {
+        "en": "Products to add",
+        "zh": "勾选要加入清单的商品",
+    },
+    "arrival_pick_confirm": {"en": "Confirm add", "zh": "确认追加"},
+    "arrival_pick_cancel": {"en": "Close", "zh": "关闭"},
+    "arrival_pick_appended": {"en": "Added {n} product(s) to the list.",
+                               "zh": "已向清单追加 {n} 个商品。"},
+    "arrival_pick_nothing_new": {
+        "en": "No new lines (already in the list).",
+        "zh": "没有新增行（可能已在清单中）。",
+    },
+    "arrival_pick_empty_sel": {
+        "en": "Please tick at least one product.",
+        "zh": "请先勾选至少一个商品。",
+    },
     "inv_title":      {"en": "Inventory Management",      "zh": "库存管理"},
     "inv_import_append": {"en": "Import stock change from products.xlsx (+/- on current stock)",
                           "zh": "从 products.xlsx 导入库存变动（正数增加，负数减少）"},
@@ -348,11 +721,132 @@ T: dict[str, dict[str, str]] = {
     },
     "inv_import_done": {"en": "Inventory import complete: {n} items updated",
                         "zh": "库存导入完成：更新 {n} 个商品"},
+    "nav_price": {"en": "Price Management", "zh": "价格管理"},
+    "price": {"en": "Price", "zh": "价格"},
+    "updated_at": {"en": "Updated At", "zh": "修改日期"},
+    "price_import_from_products": {
+        "en": "Import prices from selected file",
+        "zh": "导入选中文件中的价格",
+    },
+    "price_import_done": {
+        "en": "Price import complete: {n} items updated",
+        "zh": "价格导入完成：更新 {n} 个商品",
+    },
+    "price_apply": {"en": "Apply price", "zh": "应用价格"},
+    "price_updated": {"en": "Price updated", "zh": "价格已更新"},
+    "price_hint": {
+        "en": "Upload an Excel file with columns ItemCode / Barcode / Name and Price (or 价格 / 单价). You can also edit below.",
+        "zh": "请上传 Excel，需包含商品编号、条码、名称及价格列（支持列名 Price、价格、单价等）。也可在下方直接改价。",
+    },
+    "price_import_no_numeric_prices": {
+        "en": "Parsed prices are all zero — check that the sheet has a Price / 价格 / 单价 column with numeric values.",
+        "zh": "解析到的价格全部为 0：请确认表中有「价格」「单价」或 Price 列，且单元格为数字（勿用文本格式隐藏）。",
+    },
+    "select_import_file": {"en": "Select import file", "zh": "选择导入文件"},
+    "download_inv_template": {
+        "en": "📥 Download inventory import template (.xlsx)",
+        "zh": "📥 下载库存导入模板（.xlsx）",
+    },
+    "download_price_template": {
+        "en": "📥 Download price import template (.xlsx)",
+        "zh": "📥 下载价格导入模板（.xlsx）",
+    },
+    "grid_keyword_search": {
+        "en": "Keyword / code / barcode",
+        "zh": "关键字 / 商品编号 / 条码",
+    },
+    "grid_search_apply": {"en": "Search", "zh": "筛选"},
+    "grid_price_enter_keyword": {
+        "en": "Enter a keyword or code and click **Search** to list products.",
+        "zh": "请输入编号、条码或名称关键字，点击 **筛选** 显示商品列表。",
+    },
+    "grid_price_click_edit_hint": {
+        "en": "Click the **Current price** cell to edit (web apps cannot use double‑click on rows).",
+        "zh": "在「当前售价」列中**单击单元格**即可改价（网页端无法像桌面软件一样双击整行编辑）。",
+    },
+    "price_sheet_col": {
+        "en": "List price (sheet)",
+        "zh": "档案价（表格）",
+    },
+    "price_current_col": {
+        "en": "Current price",
+        "zh": "当前售价",
+    },
+    "grid_price_save": {"en": "Save price changes", "zh": "保存价格修改"},
+    "grid_price_no_changes": {
+        "en": "No price changes to save.",
+        "zh": "没有检测到价格变动。",
+    },
+    "excel_batch_import": {"en": "📥 Excel batch import", "zh": "📥 Excel 批量导入"},
+    "grid_inv_stock_ct": {"en": "Stock (cartons)", "zh": "库存箱数"},
+    "grid_inv_stock_pc": {"en": "Stock (pcs)", "zh": "库存个数"},
+    "grid_inv_delta_ct": {"en": "Δ cartons", "zh": "变动箱数"},
+    "grid_inv_delta_pc": {"en": "Δ pcs", "zh": "变动个数"},
+    "grid_inv_apply_rows": {
+        "en": "Apply stock changes",
+        "zh": "应用库存变动",
+    },
+    "grid_inv_no_delta": {
+        "en": "No row has non‑zero stock change.",
+        "zh": "没有填写非零的库存变动。",
+    },
+    "grid_inv_delta_hint": {
+        "en": "Enter ± cartons / pcs in **Δ** columns, then click apply.",
+        "zh": "在「变动箱数」「变动个数」列填写增减数量（可为负数），再点击「应用库存变动」。",
+    },
+    "price_full_list_expander": {
+        "en": "📋 Full price list (optional)",
+        "zh": "📋 查看全部商品价格（可选）",
+    },
+    "import_file_required": {"en": "Please choose an Excel file first.", "zh": "请先选择 Excel 文件。"},
+    "import_file_invalid": {"en": "Unable to parse selected file. Check headers/format.", "zh": "无法解析所选文件，请检查表头和格式。"},
+    "import_finished_toast": {
+        "en": "Import finished — {n} row(s) written.",
+        "zh": "导入完成：有 {n} 条已写入数据库（见下方「已更新」）。",
+    },
+    "import_finished_with_errors": {
+        "en": "Import finished with some failed rows — see details below.",
+        "zh": "导入已处理，但有部分行失败或未写入，请查看下方「错误明细」与失败条数。",
+    },
+    "import_finished_nothing_changed": {
+        "en": "No rows were written: every row already matched the system, or had no effective change. This is normal if you re-import the same file.",
+        "zh": "本次「已更新」为 0 是因为没有需要改写的数据：这些行与系统里当前价格/库存一致（例如售价与价格覆盖表相同），重新导入同一份表时常会出现。**若要改价，请先在 Excel 里改数字再导入。**",
+    },
+    "import_finished_no_effect_rows": {
+        "en": "No countable rows were processed (all blank or skipped). Check the worksheet.",
+        "zh": "未发现需要统计的有效数据行（可能全部为空或未匹配）。请检查工作表内容与列名。",
+    },
+    "import_metric_written": {
+        "en": "Updated (written)",
+        "zh": "已更新（写入）",
+    },
+    "import_metric_skipped": {
+        "en": "Skipped (no change)",
+        "zh": "跳过（无需变更）",
+    },
+    "import_metric_failed": {
+        "en": "Failed",
+        "zh": "失败",
+    },
+    "import_summary_skipped_hint": {
+        "en": "Skipped rows are listed in the middle metric (not failures).",
+        "zh": "中间数字为「与系统一致故未改写」的行数，不是错误。",
+    },
+    "import_error_detail": {
+        "en": "Problem rows",
+        "zh": "无法导入或有问题的明细",
+    },
     "inv_adjust":     {"en": "Stock Adjustment",           "zh": "库存调整"},
     "inv_change_ct":  {"en": "Change cartons (+/-)",      "zh": "变动箱数（可正负）"},
     "inv_change_pc":  {"en": "Change pcs (+/-)",          "zh": "变动个数（可正负）"},
     "inv_apply":      {"en": "Apply adjustment",          "zh": "应用调整"},
+    "inv_change_zero": {"en": "Change cannot be zero.", "zh": "变动不能为 0"},
+    "inv_adjust_ok":   {"en": "Inventory updated.",      "zh": "库存已调整"},
+    "inv_pick_product": {"en": "Select product",         "zh": "选择商品"},
     "inv_current":    {"en": "Current inventory",         "zh": "当前库存"},
+    "admin_inventory_hub": {"en": "Inventory Workspace",  "zh": "库存工作台"},
+    "admin_messages_hub":  {"en": "Message Workspace",    "zh": "消息工作台"},
+    "choose_module":       {"en": "Choose module",        "zh": "选择功能模块"},
     "inv_low_stock":  {"en": "Insufficient inventory for dispatch",
                        "zh": "库存不足，无法完成发货"},
     "mark_dispatched":{"en": "Mark as Dispatched",       "zh": "标记已发货"},
@@ -383,6 +877,7 @@ T: dict[str, dict[str, str]] = {
     "exp_recon":      {"en": "Reconciliation (Dispatched vs Received)",
                        "zh": "对账单（发货 vs 实收）"},
     "exp_short":      {"en": "Shortage Report",          "zh": "缺货报告"},
+    "exp_inventory":  {"en": "Inventory Report (All Stock)", "zh": "库存报表（全部库存）"},
     "generate":       {"en": "Generate",                 "zh": "生成"},
     "download":       {"en": "Download",                 "zh": "下载"},
     "tbd":            {"en": "(to be implemented)",      "zh": "（待实现）"},
@@ -600,10 +1095,11 @@ T: dict[str, dict[str, str]] = {
     "email_title":       {"en": "Email Notification Settings",
                           "zh": "邮件通知设置"},
     "email_subtitle":    {"en": "Send automatic email alerts for new orders, "
-                                "dispatches, and shortages. Sending is "
-                                "asynchronous — UI is never blocked.",
-                          "zh": "为新订单、发货、缺货事件自动发送邮件通知。"
-                                "邮件发送是异步的，不会阻塞页面操作。"},
+                                "dispatches, shortages, and warehouse supplier "
+                                "requests. Sending is asynchronous — UI is "
+                                "never blocked.",
+                          "zh": "为新订单、发货、缺货以及仓库向供货商下单等事件发送邮件。"
+                                "邮件异步发送，不会阻塞页面操作。"},
     "email_enabled":     {"en": "Enable email notifications",
                           "zh": "启用邮件通知"},
     "smtp_settings":     {"en": "SMTP Settings",
@@ -628,6 +1124,8 @@ T: dict[str, dict[str, str]] = {
                           "zh": "🚚 已发货"},
     "ev_shortage":       {"en": "🔔 Shortage",
                           "zh": "🔔 缺货"},
+    "ev_supplier_order": {"en": "🏭 Supplier purchase request",
+                          "zh": "🏭 向供货商下单"},
     "recipients":        {"en": "Recipients (one per line)",
                           "zh": "收件人（每行一个邮箱）"},
     "branch_recipients": {"en": "Per-branch Email (optional)",
@@ -806,6 +1304,62 @@ CREATE TABLE IF NOT EXISTS inventory_txn (
     created_at      TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_inventory_txn_created ON inventory_txn(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS product_prices (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_key        TEXT    NOT NULL UNIQUE,
+    item_code       TEXT,
+    barcode         TEXT,
+    name            TEXT    NOT NULL,
+    price           REAL    NOT NULL DEFAULT 0,
+    operator        TEXT,
+    updated_at      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_product_prices_updated ON product_prices(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_accounts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    username        TEXT    NOT NULL COLLATE NOCASE,
+    password_salt   TEXT    NOT NULL,
+    password_hash   TEXT    NOT NULL,
+    branch          TEXT    NOT NULL,
+    display_name    TEXT,
+    phone           TEXT,
+    status          TEXT    NOT NULL DEFAULT 'pending',
+    permissions     TEXT    NOT NULL DEFAULT '[]',
+    created_at      TEXT    NOT NULL,
+    reviewed_at     TEXT,
+    review_note     TEXT,
+    UNIQUE(username)
+);
+CREATE INDEX IF NOT EXISTS idx_user_accounts_status
+ON user_accounts(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_accounts_branch ON user_accounts(branch);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT    NOT NULL,
+    event_type      TEXT    NOT NULL,
+    role            TEXT    NOT NULL,
+    account_id      INTEGER,
+    username        TEXT,
+    branch          TEXT,
+    order_id        TEXT,
+    detail          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event ON audit_log(event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_branch ON audit_log(branch);
+CREATE INDEX IF NOT EXISTS idx_audit_order ON audit_log(order_id);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(username);
+
+CREATE TABLE IF NOT EXISTS branch_cart_draft (
+    account_id  INTEGER NOT NULL,
+    branch      TEXT NOT NULL,
+    cart_json   TEXT NOT NULL DEFAULT '[]',
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (account_id, branch)
+);
 """
 
 
@@ -835,6 +1389,403 @@ def init_db() -> None:
             conn.execute("ALTER TABLE orders ADD COLUMN dispatch_pcs INTEGER")
 
 
+def _branch_cart_session_ctx() -> tuple[int, str] | None:
+    """(account_id, branch) when a branch clerk session may own a server-side cart."""
+    if st.session_state.get("role") != Role.BRANCH:
+        return None
+    aid = st.session_state.get("account_id")
+    branch = st.session_state.get("branch") or ""
+    if aid is None or not str(branch).strip():
+        return None
+    try:
+        return (int(aid), str(branch).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_branch_cart_payload(raw: str | None) -> list[dict]:
+    """Load cart lines from JSON; skips invalid entries."""
+    if not raw or not str(raw).strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            q_ct = int(it.get("qty_cartons") or 0)
+            q_pc = int(it.get("qty_pcs") or 0)
+        except (TypeError, ValueError):
+            continue
+        if q_ct < 0:
+            q_ct = 0
+        if q_pc < 0:
+            q_pc = 0
+        try:
+            price = float(it.get("price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        try:
+            im_raw = int(it.get("is_manual"))
+        except (TypeError, ValueError):
+            im_raw = 0
+        out.append({
+            "item_code": str(it.get("item_code") or "").strip(),
+            "barcode": str(it.get("barcode") or "").strip(),
+            "name": name,
+            "unit": str(it.get("unit") or "").strip(),
+            "price": price,
+            "qty_cartons": q_ct,
+            "qty_pcs": q_pc,
+            "is_manual": 1 if im_raw else 0,
+        })
+    return out
+
+
+def _persist_branch_cart_to_db(account_id: int, branch: str, cart: list[dict]) -> None:
+    """Upsert serialized cart draft for branch staff (shared SQLite)."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        blob = json.dumps(cart or [], ensure_ascii=False)
+    except (TypeError, ValueError):
+        blob = "[]"
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO branch_cart_draft (account_id, branch, cart_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(account_id, branch) DO UPDATE SET
+                cart_json = excluded.cart_json,
+                updated_at = excluded.updated_at
+            """,
+            (account_id, branch, blob, now),
+        )
+
+
+def _delete_branch_cart_draft(account_id: int, branch: str) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "DELETE FROM branch_cart_draft WHERE account_id = ? AND branch = ?",
+            (account_id, branch),
+        )
+
+
+def _hydrate_branch_cart_if_needed() -> None:
+    """Restore cart from DB once per Streamlit session if memory is empty."""
+    ctx = _branch_cart_session_ctx()
+    if not ctx:
+        return
+    aid, branch = ctx
+    if st.session_state.get("_branch_cart_hydrated"):
+        return
+    st.session_state["_branch_cart_hydrated"] = True
+    if len(st.session_state.get("cart") or []) > 0:
+        return
+    row = None
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT cart_json FROM branch_cart_draft WHERE account_id = ? AND branch = ?",
+            (aid, branch),
+        ).fetchone()
+    if not row:
+        return
+    loaded = _parse_branch_cart_payload(row["cart_json"])
+    loaded = [
+        x for x in loaded
+        if x["qty_cartons"] > 0 or x["qty_pcs"] > 0
+    ]
+    if loaded:
+        st.session_state.cart = loaded
+
+
+def _persist_branch_cart() -> None:
+    ctx = _branch_cart_session_ctx()
+    if not ctx:
+        return
+    aid, branch = ctx
+    _persist_branch_cart_to_db(aid, branch, list(st.session_state.get("cart") or []))
+
+
+def _normalize_username(raw: str) -> str:
+    return (raw or "").strip().lower()
+
+
+def _validate_username(username: str) -> bool:
+    u = _normalize_username(username)
+    if len(u) < 3 or len(u) > 32:
+        return False
+    return bool(re.fullmatch(r"[a-z0-9_]+", u))
+
+
+def _hash_new_password(password: str) -> tuple[str, str]:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+    return salt.hex(), dk.hex()
+
+
+def _verify_account_password(password: str, salt_hex: str, hash_hex: str) -> bool:
+    try:
+        salt = bytes.fromhex(salt_hex)
+        dk = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, 120_000
+        )
+        ex = bytes.fromhex(hash_hex)
+        return hmac.compare_digest(dk, ex)
+    except Exception:
+        return False
+
+
+def _parse_permissions_json(raw: str | None) -> list[str]:
+    if not raw or not str(raw).strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[str] = []
+    for x in data:
+        if isinstance(x, str) and x in BRANCH_PERM_CODES:
+            out.append(x)
+    return out
+
+
+def _default_all_permissions() -> list[str]:
+    return list(BRANCH_PERM_CODES)
+
+
+def account_fetch_by_username(username: str) -> sqlite3.Row | None:
+    u = _normalize_username(username)
+    if not u:
+        return None
+    with db_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM user_accounts WHERE lower(username) = ?",
+            (u,),
+        ).fetchone()
+
+
+def account_insert_application(
+    username: str,
+    password: str,
+    branch: str,
+    display_name: str,
+    phone: str,
+) -> tuple[bool, str]:
+    """Returns (ok, error_key_or_empty). error_key is a t() key."""
+    if not _validate_username(username):
+        return False, "acct_user_invalid"
+    if branch not in BRANCHES:
+        return False, "acct_branch_invalid"
+    if len(password) < 6:
+        return False, "acct_pw_short"
+    u = _normalize_username(username)
+    existing = account_fetch_by_username(u)
+    salt, ph = _hash_new_password(password)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if existing is not None:
+        st = existing["status"]
+        if st in (ACCOUNT_STATUS_PENDING, ACCOUNT_STATUS_APPROVED):
+            return False, "acct_apply_dup"
+        if st == ACCOUNT_STATUS_REJECTED:
+            with db_conn() as conn:
+                conn.execute(
+                    """
+                    UPDATE user_accounts SET
+                        password_salt = ?, password_hash = ?, branch = ?,
+                        display_name = ?, phone = ?, status = ?,
+                        permissions = ?, created_at = ?, reviewed_at = NULL,
+                        review_note = NULL
+                    WHERE id = ?
+                    """,
+                    (
+                        salt,
+                        ph,
+                        branch,
+                        (display_name or "").strip() or None,
+                        (phone or "").strip() or None,
+                        ACCOUNT_STATUS_PENDING,
+                        json.dumps([], ensure_ascii=False),
+                        now,
+                        existing["id"],
+                    ),
+                )
+            return True, ""
+        return False, "acct_apply_dup"
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_accounts (
+                    username, password_salt, password_hash, branch,
+                    display_name, phone, status, permissions, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    u,
+                    salt,
+                    ph,
+                    branch,
+                    (display_name or "").strip() or None,
+                    (phone or "").strip() or None,
+                    ACCOUNT_STATUS_PENDING,
+                    json.dumps([], ensure_ascii=False),
+                    now,
+                ),
+            )
+    except sqlite3.IntegrityError:
+        return False, "acct_apply_dup"
+    return True, ""
+
+
+def account_try_login(username: str, password: str) -> tuple[str, sqlite3.Row | None]:
+    """Returns status: ok | pending | rejected | bad_password | not_found"""
+    row = account_fetch_by_username(username)
+    if row is None:
+        return "not_found", None
+    if not _verify_account_password(
+        password, row["password_salt"], row["password_hash"]
+    ):
+        return "bad_password", row
+    st = row["status"]
+    if st == ACCOUNT_STATUS_PENDING:
+        return "pending", row
+    if st == ACCOUNT_STATUS_REJECTED:
+        return "rejected", row
+    if st != ACCOUNT_STATUS_APPROVED:
+        return "rejected", row
+    perms = _parse_permissions_json(row["permissions"])
+    if not perms:
+        return "no_permissions", row
+    return "ok", row
+
+
+def account_set_status(
+    uid: int,
+    status: str,
+    note: str | None = None,
+) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_conn() as conn:
+        conn.execute(
+            """
+            UPDATE user_accounts
+            SET status = ?, reviewed_at = ?, review_note = ?
+            WHERE id = ?
+            """,
+            (status, now, (note or "").strip() or None, uid),
+        )
+
+
+def account_approve(uid: int, permissions: list[str]) -> None:
+    clean = [p for p in permissions if p in BRANCH_PERM_CODES]
+    if not clean:
+        clean = _default_all_permissions()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_conn() as conn:
+        conn.execute(
+            """
+            UPDATE user_accounts
+            SET status = ?, permissions = ?, reviewed_at = ?, review_note = NULL
+            WHERE id = ?
+            """,
+            (ACCOUNT_STATUS_APPROVED, json.dumps(clean, ensure_ascii=False), now, uid),
+        )
+
+
+def account_update_permissions(uid: int, permissions: list[str]) -> None:
+    clean = [p for p in permissions if p in BRANCH_PERM_CODES]
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE user_accounts SET permissions = ? WHERE id = ?",
+            (json.dumps(clean, ensure_ascii=False), uid),
+        )
+
+
+def account_set_password(uid: int, new_password: str) -> None:
+    salt, ph = _hash_new_password(new_password)
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE user_accounts SET password_salt = ?, password_hash = ? WHERE id = ?",
+            (salt, ph, uid),
+        )
+
+
+def account_create_direct(
+    username: str,
+    password: str,
+    branch: str,
+    permissions: list[str] | None,
+) -> tuple[bool, str]:
+    if not _validate_username(username):
+        return False, "acct_user_invalid"
+    if branch not in BRANCHES:
+        return False, "acct_branch_invalid"
+    if len(password) < 6:
+        return False, "acct_pw_short"
+    u = _normalize_username(username)
+    if account_fetch_by_username(u) is not None:
+        return False, "acct_apply_dup"
+    clean = (
+        [p for p in (permissions or []) if p in BRANCH_PERM_CODES]
+        or _default_all_permissions()
+    )
+    salt, ph = _hash_new_password(password)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_accounts (
+                    username, password_salt, password_hash, branch,
+                    display_name, phone, status, permissions, created_at, reviewed_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    u,
+                    salt,
+                    ph,
+                    branch,
+                    ACCOUNT_STATUS_APPROVED,
+                    json.dumps(clean, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+    except sqlite3.IntegrityError:
+        return False, "acct_apply_dup"
+    return True, ""
+
+
+def account_list_by_status(status: str | None = None) -> list[sqlite3.Row]:
+    with db_conn() as conn:
+        if status:
+            return list(
+                conn.execute(
+                    """
+                    SELECT * FROM user_accounts
+                    WHERE status = ?
+                    ORDER BY created_at DESC
+                    """,
+                    (status,),
+                ).fetchall()
+            )
+        return list(
+            conn.execute(
+                "SELECT * FROM user_accounts ORDER BY created_at DESC"
+            ).fetchall()
+        )
+
+
 def count_open_shortages() -> int:
     with db_conn() as conn:
         return conn.execute(
@@ -859,6 +1810,17 @@ def _inventory_version() -> str:
         with db_conn() as conn:
             row = conn.execute(
                 "SELECT COALESCE(MAX(updated_at), '') AS v FROM inventory"
+            ).fetchone()
+        return str(row["v"] if row and "v" in row.keys() else "")
+    except Exception:
+        return ""
+
+
+def _price_version() -> str:
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(updated_at), '') AS v FROM product_prices"
             ).fetchone()
         return str(row["v"] if row and "v" in row.keys() else "")
     except Exception:
@@ -902,30 +1864,29 @@ def _upsert_inventory_line(
     )
 
 
-def import_inventory_from_products(overwrite: bool = False) -> int:
-    """Import stock from products.xlsx.
-
-    Default (overwrite=False): **append** quantities in the sheet onto current DB
-    stock (进货场景 — each row's cartons/pcs are treated as arrivals). Rows with
-    zero arrival are skipped; products not listed in the file are untouched.
-
-    When overwrite=True: set inventory to absolute values from the sheet (full
-    replace per listed row — use sparingly).
-
-    Reads Excel-only numbers (no overlay from inventory DB — otherwise arrivals
-    would be double-counted)."""
-    df = _load_products_sheet_for_inventory_import()
+def import_inventory_from_products_detailed(
+    overwrite: bool = False, df: pd.DataFrame | None = None
+) -> ExcelSheetImportOutcome:
+    """Import stock from spreadsheet; returns counts + per-row failure reasons."""
+    out = ExcelSheetImportOutcome()
+    if df is None:
+        df = _load_products_sheet_for_inventory_import()
     if df.empty:
-        return 0
+        return out
 
-    changed = 0
     with db_conn() as conn:
-        for _, row in df.iterrows():
+        for i, (_, row) in enumerate(df.iterrows(), start=2):
+            if _df_row_is_blank_catalog_row(row):
+                continue
             item_code = str(row.get("ItemCode", "") or "").strip()
             barcode = str(row.get("Barcode", "") or "").strip()
             name = str(row.get("Name", "") or "").strip()
             unit = str(row.get("Unit", "") or "").strip()
             if not name:
+                out.n_failed += 1
+                out.failure_messages.append(
+                    f"{_import_row_ref(i, item_code, barcode, name)} → 缺少商品名称，已跳过"
+                )
                 continue
 
             qty_ct = int(float(row.get("StockCartons", 0) or 0))
@@ -942,20 +1903,32 @@ def import_inventory_from_products(overwrite: bool = False) -> int:
                 d_ct = target_ct - before_ct
                 d_pc = target_pc - before_pc
                 if d_ct == 0 and d_pc == 0:
+                    out.n_skipped_benign += 1
                     continue
-                _apply_inventory_change(
-                    conn,
-                    txn_type="ADJUST",
-                    item_code=item_code,
-                    barcode=barcode,
-                    name=name,
-                    unit=unit,
-                    change_ct=d_ct,
-                    change_pc=d_pc,
-                    operator="import_products_xlsx_overwrite",
-                )
+                try:
+                    _apply_inventory_change(
+                        conn,
+                        txn_type="ADJUST",
+                        item_code=item_code,
+                        barcode=barcode,
+                        name=name,
+                        unit=unit,
+                        change_ct=d_ct,
+                        change_pc=d_pc,
+                        operator="import_products_xlsx_overwrite",
+                    )
+                except Exception as e:
+                    out.n_failed += 1
+                    out.failure_messages.append(
+                        f"{_import_row_ref(i, item_code, barcode, name)} → {e}"
+                    )
+                    log_exception("import_inventory_row", e)
+                    continue
+                out.n_written += 1
             else:
                 if qty_ct == 0 and qty_pc == 0:
+                    # 数量为 0 的行视为「本条不导入」，不计入失败。
+                    out.n_skipped_benign += 1
                     continue
                 if qty_ct >= 0 and qty_pc >= 0:
                     txn_type = "IN"
@@ -963,19 +1936,143 @@ def import_inventory_from_products(overwrite: bool = False) -> int:
                     txn_type = "OUT"
                 else:
                     txn_type = "ADJUST"
-                _apply_inventory_change(
-                    conn,
-                    txn_type=txn_type,
-                    item_code=item_code,
-                    barcode=barcode,
-                    name=name,
-                    unit=unit,
-                    change_ct=qty_ct,
-                    change_pc=qty_pc,
-                    operator="import_products_xlsx",
+                try:
+                    _apply_inventory_change(
+                        conn,
+                        txn_type=txn_type,
+                        item_code=item_code,
+                        barcode=barcode,
+                        name=name,
+                        unit=unit,
+                        change_ct=qty_ct,
+                        change_pc=qty_pc,
+                        operator="import_products_xlsx",
+                    )
+                except Exception as e:
+                    out.n_failed += 1
+                    out.failure_messages.append(
+                        f"{_import_row_ref(i, item_code, barcode, name)} → {e}"
+                    )
+                    log_exception("import_inventory_row", e)
+                    continue
+                out.n_written += 1
+    return out
+
+
+def import_inventory_from_products(
+    overwrite: bool = False, df: pd.DataFrame | None = None
+) -> int:
+    """Import stock — backward-compatible: returns number of DB-updated rows."""
+    return import_inventory_from_products_detailed(overwrite, df).n_written
+
+
+def _upsert_product_price(
+    conn: sqlite3.Connection,
+    item_code: str,
+    barcode: str,
+    name: str,
+    price: float,
+    operator: str,
+) -> None:
+    key = _inventory_item_key(item_code, barcode, name)
+    conn.execute(
+        """
+        INSERT INTO product_prices
+        (item_key, item_code, barcode, name, price, operator, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_key) DO UPDATE SET
+            item_code=excluded.item_code,
+            barcode=excluded.barcode,
+            name=excluded.name,
+            price=excluded.price,
+            operator=excluded.operator,
+            updated_at=excluded.updated_at
+        """,
+        (
+            key,
+            (item_code or "").strip() or None,
+            (barcode or "").strip() or None,
+            (name or "").strip() or "-",
+            float(price or 0),
+            (operator or "").strip() or None,
+            now_str(),
+        ),
+    )
+
+
+def import_prices_from_products_detailed(
+    df: pd.DataFrame | None = None,
+) -> ExcelSheetImportOutcome:
+    """Import prices into DB price overlay table; returns structured outcome."""
+    out = ExcelSheetImportOutcome()
+    if df is None:
+        df = _load_products_sheet_for_inventory_import()
+    if df.empty:
+        return out
+    with db_conn() as conn:
+        for i, (_, row) in enumerate(df.iterrows(), start=2):
+            if _df_row_is_blank_catalog_row(row):
+                continue
+            item_code = str(row.get("ItemCode", "") or "").strip()
+            barcode = str(row.get("Barcode", "") or "").strip()
+            name = str(row.get("Name", "") or "").strip()
+            if not name:
+                out.n_failed += 1
+                out.failure_messages.append(
+                    f"{_import_row_ref(i, item_code, barcode, name)} → 缺少商品名称，已跳过"
                 )
-            changed += 1
-    return changed
+                continue
+            raw_p = row.get("Price")
+            try:
+                if raw_p is None or (
+                    isinstance(raw_p, float) and pd.isna(raw_p)
+                ):
+                    price = float("nan")
+                else:
+                    price = float(raw_p)
+            except (TypeError, ValueError):
+                out.n_failed += 1
+                out.failure_messages.append(
+                    f"{_import_row_ref(i, item_code, barcode, name)} → 价格格式无效（{raw_p!r}）"
+                )
+                continue
+            if price != price:  # NaN
+                out.n_failed += 1
+                out.failure_messages.append(
+                    f"{_import_row_ref(i, item_code, barcode, name)} → 缺少有效价格"
+                )
+                continue
+            if price < 0:
+                out.n_failed += 1
+                out.failure_messages.append(
+                    f"{_import_row_ref(i, item_code, barcode, name)} → 价格不能为负数（{price}）"
+                )
+                continue
+            key = _inventory_item_key(item_code, barcode, name)
+            old = conn.execute(
+                "SELECT price FROM product_prices WHERE item_key = ?",
+                (key,),
+            ).fetchone()
+            old_price = float(old["price"]) if old else None
+            if old_price is not None and abs(old_price - price) < 1e-9:
+                out.n_skipped_benign += 1
+                continue
+            _upsert_product_price(
+                conn,
+                item_code=item_code,
+                barcode=barcode,
+                name=name,
+                price=price,
+                operator="import_products_xlsx_price",
+            )
+            out.n_written += 1
+    load_products.clear()
+    return out
+
+
+def import_prices_from_products(df: pd.DataFrame | None = None) -> int:
+    """Import prices — backward-compatible: returns number of upserted price rows."""
+    return import_prices_from_products_detailed(df).n_written
 
 
 def _get_inventory_row(
@@ -1435,7 +2532,7 @@ def restore_from_sql_dump(sql_bytes: bytes) -> Path:
 #   5. Test-send button so the operator can verify SMTP without triggering a
 #      real order.
 
-EVENT_KEYS = ("new_order", "dispatched", "shortage")
+EVENT_KEYS = ("new_order", "dispatched", "shortage", "supplier_order")
 
 
 def _default_email_config() -> dict:
@@ -1451,6 +2548,7 @@ def _default_email_config() -> dict:
             "new_order":  {"enabled": True, "to": []},
             "dispatched": {"enabled": True, "to": []},
             "shortage":   {"enabled": True, "to": []},
+            "supplier_order": {"enabled": True, "to": []},
         },
         # Optional per-branch recipient — a "dispatched" event for a given
         # branch will additionally CC the address listed here.
@@ -1561,49 +2659,26 @@ def _send_smtp(
     pw = cfg.get("smtp_password") or ""
     use_tls = bool(cfg.get("use_tls", True))
 
-    def _send_once(host_target: str) -> tuple[bool, str]:
-        try:
-            # Port 465 = implicit SSL; everything else uses STARTTLS when enabled
-            if port == 465:
-                ctx = ssl.create_default_context()
-                with smtplib.SMTP_SSL(host_target, port, context=ctx, timeout=15) as s:
-                    if user:
-                        s.login(user, pw)
-                    s.send_message(msg)
-            else:
-                with smtplib.SMTP(host_target, port, timeout=15) as s:
+    try:
+        # Port 465 = implicit SSL; everything else uses STARTTLS when enabled
+        if port == 465:
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(host, port, context=ctx, timeout=15) as s:
+                if user:
+                    s.login(user, pw)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as s:
+                s.ehlo()
+                if use_tls:
+                    s.starttls(context=ssl.create_default_context())
                     s.ehlo()
-                    if use_tls:
-                        s.starttls(context=ssl.create_default_context())
-                        s.ehlo()
-                    if user:
-                        s.login(user, pw)
-                    s.send_message(msg)
-            return True, ""
-        except Exception as e:
-            return False, f"{type(e).__name__}: {e}"
-
-    ok, err = _send_once(host)
-    if ok:
+                if user:
+                    s.login(user, pw)
+                s.send_message(msg)
         return True, ""
-
-    # Some Windows/ISP networks resolve SMTP hosts to IPv6 first even when
-    # that route is unreachable (Errno 101). Retry with explicit IPv4 endpoint.
-    if "Network is unreachable" in err:
-        try:
-            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-            for info in infos:
-                ip = str(info[4][0] or "").strip()
-                if not ip:
-                    continue
-                ok2, err2 = _send_once(ip)
-                if ok2:
-                    return True, ""
-                err = err2
-        except Exception as e:
-            err = f"{err} | IPv4 fallback failed: {type(e).__name__}: {e}"
-
-    return False, err
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _send_async(
@@ -1683,53 +2758,53 @@ def send_test_email(cfg: dict, to_addr: str) -> tuple[bool, str]:
 # PRODUCTS
 # =========================================================================
 def _products_mtime() -> float:
-    return PRODUCTS_PATH.stat().st_mtime if PRODUCTS_PATH.exists() else -1.0
-
-
-def _rename_product_excel_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Map Chinese / alternate spreadsheet headers to canonical ItemCode, Name, Price, …
-
-    If the sheet uses e.g. ``商品名`` without ``Name``, or ``价格`` without ``Price``,
-    the old logic added empty canonical columns and dropped the real data."""
-    lower_to_actual = {str(c).strip().lower(): c for c in df.columns}
-    specs: list[tuple[str, list[str]]] = [
-        ("Name", ["商品名", "品名", "产品名", "产品名称", "name"]),
-        ("Price", ["价格", "单价", "售价", "price", "list price", "listprice", "单价(元)", "零售价"]),
-        ("ItemCode", ["货号", "商品编号", "item code", "itemcode", "编号"]),
-        ("Barcode", ["条码", "条形码", "barcode", "ean", "brocode"]),
-        ("Unit", ["单位", "unit"]),
-        ("Category", ["类别", "分类", "category", "品类"]),
-    ]
-    rename_map: dict[str, str] = {}
-    for canonical, alts in specs:
-        if canonical in df.columns:
-            continue
-        for a in alts:
-            lo = a.strip().lower()
-            if lo in lower_to_actual:
-                src = lower_to_actual[lo]
-                if src != canonical:
-                    rename_map[src] = canonical
-                break
-    if rename_map:
-        df = df.rename(columns=rename_map)
-    return df
+    p = products_master_excel_path()
+    return p.stat().st_mtime if p.exists() else -1.0
 
 
 def _parse_products_excel_after_read(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     """Normalize dtypes / stock aliases. Does NOT overlay SQLite inventory."""
-    df = _rename_product_excel_columns(df)
     for col in [
         "ItemCode", "Barcode", "Name", "Unit", "Price", "Category",
+        "PcsPerCarton",
         "StockCartons", "StockPcs", "StockTotal",
     ]:
         if col not in df.columns:
-            df[col] = ""
+            df[col] = "" if col not in ("PcsPerCarton",) else 0.0
     for c in ["ItemCode", "Barcode", "Name", "Unit", "Category"]:
         df[c] = df[c].astype(str).fillna("").replace({"nan": "", "None": ""})
     for c in ["ItemCode", "Barcode"]:
         df[c] = df[c].str.replace(r"\.0$", "", regex=True)
-    df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
+    col_by_lower = {str(c).strip().lower(): c for c in df.columns}
+
+    def _find_col(candidates: list[str]) -> str | None:
+        for cand in candidates:
+            hit = col_by_lower.get(cand.strip().lower())
+            if hit:
+                return hit
+        return None
+
+    # Price: Excel often uses 价格/单价 instead of "Price"; map aliases first.
+    price_candidates = [
+        "Price", "价格", "单价", "售价", "零售价", "批发价", "进货价",
+        "UnitPrice", "unit_price", "ListPrice", "MSRP",
+        "单价(元)", "价格(元)", "售价(元)",
+    ]
+    price_src = _find_col(price_candidates)
+    if price_src:
+        df["Price"] = pd.to_numeric(df[price_src], errors="coerce").fillna(0.0)
+    else:
+        df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
+
+    pcs_carton_candidates = [
+        "PcsPerCarton", "每箱个数", "箱规", "箱装数", "PackSize",
+        "QtyPerCarton", "PCS_PER_CARTON", "每箱包数",
+    ]
+    pcs_src = _find_col(pcs_carton_candidates)
+    if pcs_src:
+        df["PcsPerCarton"] = pd.to_numeric(df[pcs_src], errors="coerce").fillna(0.0)
+    df["PcsPerCarton"] = pd.to_numeric(df["PcsPerCarton"], errors="coerce").fillna(0.0)
+
     stock_ct_candidates = [
         "StockCartons", "库存箱数", "库存(箱)", "库存箱", "CartonsStock", "Stock_Cartons",
     ]
@@ -1740,14 +2815,6 @@ def _parse_products_excel_after_read(df: pd.DataFrame) -> tuple[pd.DataFrame, bo
         "StockTotal", "Stock", "库存", "可用库存", "Available", "QtyAvailable",
     ]
     has_stock_info = False
-    col_by_lower = {str(c).strip().lower(): c for c in df.columns}
-
-    def _find_col(candidates: list[str]) -> str | None:
-        for cand in candidates:
-            hit = col_by_lower.get(cand.strip().lower())
-            if hit:
-                return hit
-        return None
 
     ct_col = _find_col(stock_ct_candidates)
     if ct_col:
@@ -1772,14 +2839,16 @@ def _parse_products_excel_after_read(df: pd.DataFrame) -> tuple[pd.DataFrame, bo
 
 def _load_products_sheet_for_inventory_import() -> pd.DataFrame:
     """Rows and stock columns straight from spreadsheet (before DB overlay)."""
-    if not PRODUCTS_PATH.exists():
+    master = products_master_excel_path()
+    if not master.exists():
         return pd.DataFrame()
     try:
         df = pd.read_excel(
-            PRODUCTS_PATH,
+            master,
             dtype={"ItemCode": str, "Barcode": str, "Category": str, "Unit": str},
         )
         df = df.rename(columns=lambda c: str(c).replace("\ufeff", "").strip())
+        df = _normalize_product_sheet_columns(df)
         df, _ = _parse_products_excel_after_read(df)
         df.loc[df["Category"].str.strip() == "", "Category"] = "General"
         return df
@@ -1788,15 +2857,101 @@ def _load_products_sheet_for_inventory_import() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
-def load_products(_mtime: float = -1.0, _inv_ver: str = "") -> pd.DataFrame:
+def _load_products_sheet_from_upload(uploaded_file) -> pd.DataFrame:
+    """Load products-like Excel from uploaded file for safe explicit import."""
+    if uploaded_file is None:
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(
+            uploaded_file,
+            dtype={"ItemCode": str, "Barcode": str, "Category": str, "Unit": str},
+        )
+        df = df.rename(columns=lambda c: str(c).replace("\ufeff", "").strip())
+        df = _normalize_product_sheet_columns(df)
+        df, _ = _parse_products_excel_after_read(df)
+        df.loc[df["Category"].str.strip() == "", "Category"] = "General"
+        return df
+    except Exception as e:
+        log_exception("load_products_sheet_from_upload", e)
+        return pd.DataFrame()
+
+
+def _build_inventory_import_template_bytes() -> bytes:
+    """Excel template for inventory import; sheet1 matches parser column names.
+
+    A second sheet contains brief Chinese instructions. Import only reads the
+    first worksheet (default read_excel behavior)."""
+    n = 8
+    main = pd.DataFrame({
+        "ItemCode":     [""] * n,
+        "Barcode":      [""] * n,
+        "Name":         [""] * n,
+        "Unit":         [""] * n,
+        "StockCartons": [""] * n,
+        "StockPcs":     [""] * n,
+    })
+    lines = [
+        "填写说明（导入时不会读取本页）",
+        "",
+        "① 请在「库存导入」工作表中填写。导入程序只读取第一张表。",
+        "② 必填：商品名称(Name)。建议填写 商品编号(ItemCode) 或 条码(Barcode)，便于与商品档案对应。",
+        "③ 库存变动导入：填写 StockCartons（库存箱数）、StockPcs（库存个数）；正数加仓、负数减仓；两列均为 0 的行会跳过。",
+        "④ 列名也支持中文别名，例如：库存箱数、库存个数、库存（与系统导入说明一致）。",
+        "⑤「覆盖库存」模式会把该行库存设为表中的箱数/个数，请谨慎使用。",
+    ]
+    instr = pd.DataFrame({"说明": lines})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        main.to_excel(writer, sheet_name="库存导入", index=False)
+        instr.to_excel(writer, sheet_name="填写说明", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _build_price_import_template_bytes() -> bytes:
+    """Excel template for price import; first sheet has ItemCode, Barcode, Name, Price."""
+    n = 8
+    main = pd.DataFrame({
+        "ItemCode": [""] * n,
+        "Barcode":  [""] * n,
+        "Name":     [""] * n,
+        "Price":    [""] * n,
+    })
+    lines = [
+        "填写说明（导入时不会读取本页）",
+        "",
+        "① 请在「价格导入」工作表中填写。导入程序只读取第一张表。",
+        "② 必填：商品名称(Name)。必须包含价格列：Price，或使用中文列名 价格、单价、售价 等。",
+        "③ 建议同时填写 ItemCode 或 Barcode，与商品档案一致。价格为数字（元）。",
+        "④ 未改价的商品可留空不填；名称为空的行会被跳过。",
+    ]
+    instr = pd.DataFrame({"说明": lines})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        main.to_excel(writer, sheet_name="价格导入", index=False)
+        instr.to_excel(writer, sheet_name="填写说明", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@st.cache_data(
+    ttl=300,
+    # Replaces the default “Running load_products(...)” status with a branded line.
+    show_spinner="☀️ 载入商品资料 · Loading catalog…",
+)
+def load_products(
+    _mtime: float = -1.0,
+    _inv_ver: str = "",
+    _price_ver: str = "",
+) -> pd.DataFrame:
     """Load product master from products.xlsx; auto-create demo if missing.
 
     Recognized columns: ItemCode, Barcode, Name, Unit, Price, Category.
     Category is optional. When present, it's used to group items in the
     warehouse picking-slip exports (Frozen / Rice / Beverage / etc.).
     Items without a category fall back to 'General'."""
-    if not PRODUCTS_PATH.exists():
+    master = products_master_excel_path()
+    if not master.exists():
         demo = pd.DataFrame({
             "ItemCode": ["P001", "P002", "P003", "P004", "P005"],
             "Barcode":  ["8801234567001", "8801234567002", "8801234567003",
@@ -1806,6 +2961,7 @@ def load_products(_mtime: float = -1.0, _inv_ver: str = "") -> pd.DataFrame:
             "Unit":     ["bag", "bag", "bottle", "pc", "can"],
             "Price":    [12.5, 3.2, 4.8, 1.5, 2.0],
             "Category": ["Rice", "General", "General", "General", "Beverage"],
+            "PcsPerCarton": [10, 20, 12, 1, 24],
         })
         try:
             demo.to_excel(PRODUCTS_PATH, index=False)
@@ -1817,11 +2973,12 @@ def load_products(_mtime: float = -1.0, _inv_ver: str = "") -> pd.DataFrame:
         # pandas infers them as floats (especially large numeric barcodes
         # like 8801234567001), and "8801234567001.0" never matches anything.
         df = pd.read_excel(
-            PRODUCTS_PATH,
+            master,
             dtype={"ItemCode": str, "Barcode": str, "Category": str, "Unit": str},
         )
         # Normalize headers from Excel/WPS (trim spaces, remove BOM).
         df = df.rename(columns=lambda c: str(c).replace("\ufeff", "").strip())
+        df = _normalize_product_sheet_columns(df)
         df, has_stock_info = _parse_products_excel_after_read(df)
         # Prefer inventory table values when available.
         try:
@@ -1862,31 +3019,147 @@ def load_products(_mtime: float = -1.0, _inv_ver: str = "") -> pd.DataFrame:
                 )
         except Exception as e:
             log_exception("load_products_inventory_overlay", e)
+        try:
+            with db_conn() as conn:
+                price_rows = conn.execute(
+                    "SELECT item_code, barcode, name, price FROM product_prices"
+                ).fetchall()
+            by_ic = {
+                str(r["item_code"]).strip().lower(): float(r["price"] or 0)
+                for r in price_rows if (r["item_code"] or "").strip()
+            }
+            by_bc = {
+                str(r["barcode"]).strip().lower(): float(r["price"] or 0)
+                for r in price_rows if (r["barcode"] or "").strip()
+            }
+            by_nm = {
+                str(r["name"]).strip().lower(): float(r["price"] or 0)
+                for r in price_rows if (r["name"] or "").strip()
+            }
+            for idx, row in df.iterrows():
+                ic = str(row.get("ItemCode", "") or "").strip().lower()
+                bc = str(row.get("Barcode", "") or "").strip().lower()
+                nm = str(row.get("Name", "") or "").strip().lower()
+                hit = (by_ic.get(ic) if ic else None)
+                if hit is None:
+                    hit = (by_bc.get(bc) if bc else None)
+                if hit is None:
+                    hit = (by_nm.get(nm) if nm else None)
+                if hit is not None:
+                    df.at[idx, "Price"] = float(hit)
+        except Exception as e:
+            log_exception("load_products_price_overlay", e)
         df["_has_stock_info"] = bool(has_stock_info)
         # Items with no category fall back to "General" so grouping always works
         df.loc[df["Category"].str.strip() == "", "Category"] = "General"
         return df
     except Exception as e:
-        st.error(f"Error loading products.xlsx: {e}")
+        st.error(f"Error loading catalog ({master.name}): {e}")
         return pd.DataFrame(columns=[
             "ItemCode", "Barcode", "Name", "Unit", "Price", "Category",
+            "PcsPerCarton",
             "StockCartons", "StockPcs", "StockTotal", "_has_stock_info",
         ])
 
 
 def search_products(query: str, limit: int = 80) -> pd.DataFrame:
-    df = load_products(_products_mtime(), _inventory_version())
+    df = load_products(_products_mtime(), _inventory_version(), _price_version())
     if df.empty:
         return df
     q = (query or "").strip().lower()
     if not q:
         return df.head(limit)
-    mask = (
-        df["Name"].str.lower().str.contains(q, na=False, regex=False)
-        | df["Barcode"].str.lower().str.contains(q, na=False, regex=False)
-        | df["ItemCode"].str.lower().str.contains(q, na=False, regex=False)
-    )
+
+    def _col_q(col: str) -> pd.Series:
+        """Robust string match: handles numeric SKUs read as float (e.g. 11.0)."""
+        s = df[col].fillna("").astype(str).str.strip().str.lower()
+        s = s.str.replace(r"\.0$", "", regex=True)
+        return s.str.contains(q, na=False, regex=False)
+
+    mask = _col_q("Name") | _col_q("Barcode") | _col_q("ItemCode")
     return df[mask].head(limit)
+
+
+def _product_master_excel_columns() -> list[str]:
+    return [
+        "ItemCode", "Barcode", "Name", "Unit", "Price", "Category",
+        "PcsPerCarton", "StockCartons", "StockPcs", "StockTotal",
+    ]
+
+
+def _shelf_bootstrap_dataframe() -> pd.DataFrame:
+    raw = _load_products_sheet_for_inventory_import()
+    if raw is not None and not raw.empty:
+        return raw
+    return pd.DataFrame(
+        [
+            {
+                "ItemCode": "", "Barcode": "", "Name": "", "Unit": "箱",
+                "Price": 0.0, "Category": "General",
+                "PcsPerCarton": 1.0,
+                "StockCartons": 0.0, "StockPcs": 0.0,
+            }
+        ]
+    )
+
+
+def admin_wipe_all_products_and_stock() -> None:
+    """Remove catalog file rows, inventory, price overrides, and inventory history."""
+    with db_conn() as conn:
+        conn.execute("DELETE FROM inventory")
+        conn.execute("DELETE FROM inventory_txn")
+        conn.execute("DELETE FROM product_prices")
+    empty = pd.DataFrame(columns=_product_master_excel_columns())
+    empty.to_excel(products_master_excel_path(), index=False)
+    load_products.clear()
+
+
+def admin_save_shelf_catalog(edited: pd.DataFrame) -> tuple[int, int]:
+    """Persist shelf editor dataframe to Excel, clear DB prices, sync inventory.
+
+    Returns (saved_product_rows, inventory_adjust_rows)."""
+    cols = _product_master_excel_columns()
+    df = edited.copy()
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0.0 if c in (
+                "Price", "PcsPerCarton", "StockCartons", "StockPcs", "StockTotal",
+            ) else ""
+    df = df[cols]
+    for sc in ["ItemCode", "Barcode", "Name", "Unit", "Category"]:
+        df[sc] = df[sc].fillna("").astype(str).str.strip()
+    for nc in ["Price", "PcsPerCarton", "StockCartons", "StockPcs", "StockTotal"]:
+        df[nc] = pd.to_numeric(df[nc], errors="coerce").fillna(0.0)
+    df.loc[df["Category"].str.strip() == "", "Category"] = "General"
+    df.loc[df["Unit"].str.strip() == "", "Unit"] = "箱"
+    df["StockTotal"] = df["StockCartons"] * df["PcsPerCarton"] + df["StockPcs"]
+    mask_name = df["Name"].str.strip() != ""
+    df = df[mask_name].copy()
+    if df.empty:
+        return 0, 0
+    with db_conn() as conn:
+        conn.execute("DELETE FROM product_prices")
+    df.to_excel(products_master_excel_path(), index=False)
+    load_products.clear()
+    inv_n = import_inventory_from_products(overwrite=True, df=df)
+    return len(df), inv_n
+
+
+def _sheet_price_lookup() -> dict[str, float]:
+    """Item_key → Price as stored in products.xlsx (before DB price overlay)."""
+    df = _load_products_sheet_for_inventory_import()
+    if df.empty:
+        return {}
+    out: dict[str, float] = {}
+    for _, row in df.iterrows():
+        ic = str(row.get("ItemCode", "") or "").strip()
+        bc = str(row.get("Barcode", "") or "").strip()
+        nm = str(row.get("Name", "") or "").strip()
+        if not nm:
+            continue
+        k = _inventory_item_key(ic, bc, nm)
+        out[k] = float(row.get("Price", 0) or 0)
+    return out
 
 
 # =========================================================================
@@ -1916,6 +3189,122 @@ def _append_app_log(level: str, where: str, detail: str) -> None:
 
 def log_exception(where: str, exc: Exception) -> None:
     _append_app_log("ERROR", where, f"{type(exc).__name__}: {exc}")
+
+
+def audit_write(
+    event_type: str,
+    *,
+    order_id: str | None = None,
+    branch: str | None = None,
+    detail: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Append one row to audit_log. Best-effort; does not raise to callers."""
+    try:
+        created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        role = str(st.session_state.get("role") or "")
+        account_id = st.session_state.get("account_id")
+        username = st.session_state.get("account_username")
+        if role == Role.WAREHOUSE and not username:
+            username = "warehouse"
+        elif role == Role.ADMIN and not username:
+            username = "admin"
+        b = branch if branch is not None else st.session_state.get("branch")
+        parts: dict = {}
+        if extra:
+            parts.update(extra)
+        if detail:
+            parts["message"] = detail
+        detail_json = json.dumps(parts, ensure_ascii=False) if parts else None
+        with db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_log (
+                    created_at, event_type, role, account_id, username,
+                    branch, order_id, detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created,
+                    event_type,
+                    role,
+                    account_id,
+                    username,
+                    b,
+                    order_id,
+                    detail_json,
+                ),
+            )
+    except Exception as e:
+        log_exception("audit_write", e)
+
+
+def _audit_event_label(code: str) -> str:
+    key = {
+        "login": "audit_ev_login",
+        "logout": "audit_ev_logout",
+        "order_submit": "audit_ev_order",
+        "receive_confirm": "audit_ev_receive",
+        "supplier_order": "audit_ev_supplier",
+        "catalog_reset": "audit_ev_catalog_reset",
+        "catalog_save": "audit_ev_catalog_save",
+    }.get(code)
+    return t(key) if key else code
+
+
+def _format_audit_detail_display(detail_raw: str | None, event_type: str) -> str:
+    """Turn stored JSON detail into human-readable text for the admin table."""
+    s = (detail_raw or "").strip()
+    if not s:
+        return ""
+    try:
+        d: object = json.loads(s)
+    except json.JSONDecodeError:
+        return s
+    if not isinstance(d, dict):
+        return s
+
+    parts: list[str] = []
+
+    if d.get("method") == "shared_password":
+        pr = str(d.get("portal_role") or "")
+        role_lab = {
+            Role.WAREHOUSE: t("role_warehouse"),
+            Role.ADMIN: t("role_admin"),
+            Role.BRANCH: t("role_branch"),
+        }.get(pr, pr or "-")
+        parts.append(t("audit_d_shared_login").format(role=role_lab))
+    elif d.get("method") == "branch_account" and d.get("account_id") is not None:
+        parts.append(
+            t("audit_d_branch_login").format(id=int(d["account_id"]))
+        )
+
+    if event_type == "logout" and d.get("page") is not None:
+        parts.append(t("audit_d_logout_page").format(page=str(d["page"])))
+
+    if "line_count" in d and event_type in ("order_submit", "receive_confirm"):
+        parts.append(t("audit_d_line_count").format(n=int(d["line_count"])))
+
+    if event_type == "receive_confirm" and "any_shortage" in d:
+        parts.append(
+            t("audit_d_has_short")
+            if d.get("any_shortage")
+            else t("audit_d_no_short")
+        )
+
+    if event_type == "supplier_order":
+        if (d.get("title") or "").strip():
+            tit = str(d.get("title") or "").strip()
+            parts.append(t("audit_d_supplier_title").format(title=tit[:240]))
+        if d.get("lines") is not None:
+            parts.append(t("audit_d_supplier_lines").format(n=int(d["lines"])))
+
+    msg = (d.get("message") or "").strip()
+    if msg and msg not in parts:
+        parts.append(msg)
+
+    out = " · ".join(p for p in parts if p)
+    return out if out else s
 
 
 def _order_fingerprint(branch: str, cart_snapshot: list[dict]) -> str:
@@ -2182,6 +3571,30 @@ def _call_gemini_api(question: str, context_text: str) -> tuple[bool, str]:
         lines.append(f"({_safe_text(last_err, 2000)})")
         return False, "\n\n".join(lines)
 
+    err_l = (last_err or "").lower()
+    # Google may disable keys exposed in repos/chats; message contains "leaked".
+    if last_http == 403 and "leaked" in err_l:
+        return False, "\n\n".join([
+            t("ai_key_leaked_403"),
+            "",
+            t("ai_key_leaked_actions"),
+            "",
+            f"({_safe_text(last_err, 2000)})",
+        ])
+
+    if last_http == 400 and (
+        "api key not valid" in err_l
+        or "api_key_invalid" in err_l
+        or "invalid api key" in err_l
+    ):
+        return False, "\n\n".join([
+            t("ai_key_invalid_400"),
+            "",
+            t("ai_key_invalid_actions"),
+            "",
+            f"({_safe_text(last_err, 2000)})",
+        ])
+
     return False, f"{t('ai_error')}\n\n({_safe_text(last_err, 1500)})"
 
 
@@ -2297,7 +3710,7 @@ def scan_and_import_root_images(verbose: bool = False) -> dict:
     if not root.exists():
         return summary
 
-    products_df = load_products(_products_mtime(), _inventory_version())
+    products_df = load_products(_products_mtime(), _inventory_version(), _price_version())
 
     PRODUCT_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2503,6 +3916,51 @@ def build_new_order_excel(order_id: str, branch: str, lines: list[dict]) -> byte
     return bio.getvalue()
 
 
+def build_supplier_order_excel(lines: list[dict], remarks: str, ts: str) -> bytes:
+    """Excel attachment for warehouse → supplier order (product lines + remarks)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "SupplierOrder"
+    ws.append([
+        "ItemCode",
+        "Barcode",
+        "Name",
+        "Unit",
+        "Cartons",
+        "Pcs",
+    ])
+    for it in lines:
+        ws.append([
+            str(it.get("item_code", "") or ""),
+            str(it.get("barcode", "") or ""),
+            str(it.get("name", "") or ""),
+            str(it.get("unit", "") or ""),
+            int(it.get("qty_cartons", 0) or 0),
+            int(it.get("qty_pcs", 0) or 0),
+        ])
+    if (remarks or "").strip():
+        ws.append([])
+        ws.append(["Remarks / 备注", (remarks or "").strip(), "", "", "", ""])
+    ws.append([])
+    ws.append(["Generated / 生成时间", ts, "", "", "", ""])
+    _style_excel_header(ws, 6)
+    _autosize(ws)
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def _safe_excel_filename(title: str) -> str:
+    s = (title or "").strip()
+    for ch in '\\/:*?"<>|':
+        s = s.replace(ch, "_")
+    s = " ".join(s.split())
+    if not s:
+        s = "supplier_order"
+    return s[:120]
+
+
 def build_dispatched_email(order_id: str, branch: str,
                            lines: list[dict]) -> tuple[str, str]:
     """`lines` should each have qty_cartons / qty_pcs (=ordered) and
@@ -2619,15 +4077,16 @@ def build_shortage_email(order_id: str, branch: str,
 # =========================================================================
 CSS = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap');
+
 /* ----- App shell (full viewport) ----- */
 .stApp {
-    background: linear-gradient(
-        155deg,
-        #d4e3f5 0%,
-        #e4ecf7 28%,
-        #eef2f9 55%,
-        #e8edf5 100%
-    );
+    font-family: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+    background-color: #f1f5f9;
+    background-image:
+        radial-gradient(ellipse 120% 80% at 100% -10%, rgba(59, 130, 246, 0.09), transparent 50%),
+        radial-gradient(ellipse 90% 60% at -15% 40%, rgba(14, 165, 233, 0.07), transparent 45%),
+        radial-gradient(ellipse 70% 50% at 80% 100%, rgba(251, 191, 36, 0.06), transparent 40%);
     background-attachment: fixed;
 }
 
@@ -2647,13 +4106,19 @@ section[data-testid="stMain"] .block-container {
     padding-top: 2.5rem;
     padding-bottom: 2.75rem;
     max-width: 1180px;
-    background: rgba(255, 255, 255, 0.94);
-    backdrop-filter: saturate(160%) blur(8px);
-    border-radius: 20px;
-    border: 1px solid rgba(148, 163, 184, 0.4);
+    background: linear-gradient(
+        165deg,
+        rgba(255, 255, 255, 0.97) 0%,
+        rgba(248, 250, 252, 0.96) 100%
+    );
+    backdrop-filter: saturate(180%) blur(12px);
+    border-radius: 22px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
     box-shadow:
-        0 1px 3px rgba(15, 23, 42, 0.05),
-        0 18px 48px -12px rgba(25, 118, 210, 0.14);
+        0 0 0 1px rgba(255, 255, 255, 0.8) inset,
+        0 1px 2px rgba(15, 23, 42, 0.04),
+        0 24px 56px -16px rgba(30, 64, 175, 0.12),
+        0 12px 32px -18px rgba(15, 23, 42, 0.08);
 }
 @media (max-width: 640px) {
     section[data-testid="stMain"] .block-container {
@@ -2696,68 +4161,160 @@ section[data-testid="stMain"] h4 {
 
 /* Page hero (HTML titles from render_page_heading) */
 .page-hero {
-    background: linear-gradient(105deg, #f8fafc 0%, #ffffff 55%);
-    border: 1px solid #e2e8f0;
-    border-left: 4px solid #1976d2;
-    border-radius: 14px;
-    padding: 18px 22px;
-    margin: 0 0 1.35rem 0;
-    box-shadow: 0 2px 14px rgba(15, 23, 42, 0.05);
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(
+        125deg,
+        #0f172a 0%,
+        #1e3a5f 42%,
+        #1e40af 78%,
+        #2563eb 100%
+    );
+    border: none;
+    border-radius: 16px;
+    padding: 22px 26px 22px 26px;
+    margin: 0 0 1.5rem 0;
+    box-shadow:
+        0 4px 6px -1px rgba(15, 23, 42, 0.12),
+        0 20px 40px -12px rgba(30, 58, 138, 0.45),
+        0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+}
+.page-hero::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+        ellipse 70% 120% at 100% 0%,
+        rgba(251, 191, 36, 0.15),
+        transparent 55%
+    );
+    pointer-events: none;
+}
+.page-hero::after {
+    content: "";
+    position: absolute;
+    right: -20%;
+    top: -40%;
+    width: 55%;
+    height: 160%;
+    background: radial-gradient(circle, rgba(255,255,255,0.12) 0%, transparent 65%);
+    pointer-events: none;
+}
+.page-hero-text {
+    position: relative;
+    z-index: 1;
 }
 .page-hero-title {
     margin: 0;
-    font-size: 1.45rem;
+    font-size: 1.55rem;
     font-weight: 700;
-    color: #0f172a;
-    letter-spacing: -0.02em;
-    line-height: 1.25;
+    color: #f8fafc;
+    letter-spacing: -0.03em;
+    line-height: 1.2;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
 }
 .page-hero-desc {
-    margin: 0.55rem 0 0 0;
-    font-size: 0.9rem;
-    color: #64748b;
-    line-height: 1.55;
+    margin: 0.65rem 0 0 0;
+    font-size: 0.92rem;
+    color: rgba(226, 232, 240, 0.92);
+    line-height: 1.6;
     max-width: 52rem;
 }
 
 /* In-page section strip (render_section_title) */
 .section-title {
-    margin: 1.4rem 0 0.75rem 0;
+    margin: 1.55rem 0 0.85rem 0;
 }
 .section-title span {
-    display: inline-block;
-    font-size: 1.05rem;
-    font-weight: 650;
-    color: #1e293b;
-    padding-bottom: 0.35rem;
-    border-bottom: 2px solid #90caf9;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.06rem;
+    font-weight: 700;
+    color: #0f172a;
+    letter-spacing: -0.02em;
+    padding: 0.45rem 1rem 0.45rem 0.85rem;
+    background: linear-gradient(90deg, rgba(241, 245, 249, 0.95), rgba(255, 255, 255, 0.4));
+    border-radius: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-left: 4px solid #2563eb;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+.section-title span::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #3b82f6, #60a5fa);
+    flex-shrink: 0;
 }
 
 /* ---------- Blue gradient header ---------- */
 .sunshine-header {
-    background: linear-gradient(90deg, #1565c0 0%, #1976d2 50%, #42a5f5 100%);
-    padding: 18px 22px;
-    border-radius: 14px;
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(
+        115deg,
+        #0c1929 0%,
+        #132e52 35%,
+        #1d4ed8 72%,
+        #0ea5e9 100%
+    );
+    padding: 20px 24px;
+    border-radius: 16px;
     color: #fff;
-    margin-bottom: 16px;
-    box-shadow: 0 4px 20px rgba(25, 118, 210, 0.28);
+    margin-bottom: 18px;
+    box-shadow:
+        0 4px 6px -1px rgba(15, 23, 42, 0.15),
+        0 16px 40px -8px rgba(29, 78, 216, 0.35);
     display: flex;
     align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.sunshine-header::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+        ellipse 80% 100% at 90% -20%,
+        rgba(251, 191, 36, 0.18),
+        transparent 50%
+    );
+    pointer-events: none;
+}
+.sunshine-header > div:first-child {
+    position: relative;
+    z-index: 1;
 }
 .sunshine-header .title-main {
-    font-size: 22px; font-weight: 700; line-height: 1.2;
-    display: flex; align-items: center; gap: 10px;
+    font-size: 23px;
+    font-weight: 700;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+    display: flex;
+    align-items: center;
+    gap: 10px;
 }
 .sunshine-header .title-sub {
-    font-size: 13px; opacity: .92; margin-top: 2px;
+    font-size: 13px;
+    opacity: 0.88;
+    margin-top: 4px;
+    font-weight: 500;
 }
 .sunshine-header .title-context {
-    font-size: 13px; opacity: .9;
-    background: rgba(255,255,255,.15);
-    padding: 4px 10px; border-radius: 6px;
+    position: relative;
+    z-index: 1;
+    font-size: 13px;
+    opacity: 0.95;
+    font-weight: 600;
+    background: rgba(255, 255, 255, 0.14);
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    backdrop-filter: blur(6px);
 }
 .sunshine-header .title-meta {
     margin-top: 6px;
@@ -2818,38 +4375,82 @@ section[data-testid="stMain"] h4 {
 
 /* ---------- Metric card ---------- */
 .metric-card {
-    background: #fff;
-    border: 1px solid #e2e8f0;
-    border-left: 4px solid #1976d2;
-    padding: 14px 16px; border-radius: 12px;
-    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.06);
-    color: #222;
+    background: linear-gradient(145deg, #ffffff 0%, #f8fafc 100%);
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-left: 4px solid #2563eb;
+    padding: 16px 18px;
+    border-radius: 14px;
+    box-shadow:
+        0 1px 3px rgba(15, 23, 42, 0.04),
+        0 8px 24px -8px rgba(30, 64, 175, 0.12);
+    color: #0f172a;
 }
-.metric-card .label { font-size: 13px; color: #64748b; }
-.metric-card .value { font-size: 28px; font-weight: 700; color: #1976d2; margin-top: 4px; }
-.metric-card.warn  { border-left-color: #fbc02d; } .metric-card.warn  .value { color: #f57c00; }
-.metric-card.ok    { border-left-color: #388e3c; } .metric-card.ok    .value { color: #2e7d32; }
-.metric-card.alert { border-left-color: #e53935; } .metric-card.alert .value { color: #c62828; }
+.metric-card .label {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #64748b;
+}
+.metric-card .value {
+    font-size: 28px;
+    font-weight: 700;
+    color: #1d4ed8;
+    margin-top: 6px;
+    letter-spacing: -0.02em;
+}
+.metric-card.warn  { border-left-color: #eab308; }
+.metric-card.warn  .value { color: #ca8a04; }
+.metric-card.ok    { border-left-color: #16a34a; }
+.metric-card.ok    .value { color: #15803d; }
+.metric-card.alert { border-left-color: #dc2626; }
+.metric-card.alert .value { color: #b91c1c; }
 
 /* ---------- Sidebar ---------- */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #f8fafc 0%, #e8eef5 100%);
-    border-right: 1px solid #cbd5e1;
+    background: linear-gradient(195deg, #0f172a 0%, #1e293b 55%, #1e3a5f 100%);
+    border-right: 1px solid rgba(148, 163, 184, 0.2);
+    box-shadow: 4px 0 24px rgba(15, 23, 42, 0.12);
 }
 section[data-testid="stSidebar"] .block-container {
     padding-top: 1.6rem;
+}
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] span {
+    color: rgba(241, 245, 249, 0.92) !important;
 }
 section[data-testid="stSidebar"] .stButton > button {
     width: 100%;
     text-align: left;
     justify-content: flex-start;
-    border-radius: 10px;
+    border-radius: 12px;
     font-weight: 600;
-    transition: transform 0.1s ease, box-shadow 0.1s ease, border-color 0.1s ease;
+    border: 1px solid rgba(148, 163, 184, 0.25) !important;
+    background: rgba(255, 255, 255, 0.06) !important;
+    color: #e2e8f0 !important;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 section[data-testid="stSidebar"] .stButton > button:hover {
     transform: translateY(-1px);
-    box-shadow: 0 3px 10px rgba(25, 118, 210, 0.12);
+    background: rgba(255, 255, 255, 0.12) !important;
+    border-color: rgba(96, 165, 250, 0.45) !important;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+}
+section[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%) !important;
+    border: 1px solid rgba(147, 197, 253, 0.45) !important;
+    color: #fff !important;
+    box-shadow:
+        0 2px 8px rgba(37, 99, 235, 0.35),
+        0 0 0 1px rgba(255, 255, 255, 0.12) inset;
+}
+section[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%) !important;
+}
+section[data-testid="stSidebar"] hr {
+    border: none;
+    border-top: 1px solid rgba(148, 163, 184, 0.25);
+    margin: 1rem 0;
 }
 
 /* ---------- Sidebar branch identity card ---------- */
@@ -2873,6 +4474,21 @@ section[data-testid="stSidebar"] .stButton > button:hover {
     color: #0d47a1;
     letter-spacing: 0.3px;
     word-break: break-word;
+}
+section[data-testid="stSidebar"] .branch-identity {
+    border: 1px solid rgba(96, 165, 250, 0.35);
+    background: linear-gradient(
+        165deg,
+        rgba(30, 58, 138, 0.5) 0%,
+        rgba(15, 23, 42, 0.55) 100%
+    );
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
+}
+section[data-testid="stSidebar"] .branch-identity .k {
+    color: #93c5fd;
+}
+section[data-testid="stSidebar"] .branch-identity .v {
+    color: #f8fafc;
 }
 @media (max-width: 640px) {
     .branch-identity .v {
@@ -2903,38 +4519,237 @@ section[data-testid="stMain"] .stTextArea textarea {
 section[data-testid="stMain"] div[data-testid="stDataFrame"] {
     border-radius: 12px;
     overflow: hidden;
-    border: 1px solid #e2e8f0;
-}
-section[data-testid="stMain"] hr {
-    margin: 1.35rem 0;
-    border: none;
-    border-top: 1px solid #e2e8f0;
+    border: 1px solid rgba(148, 163, 184, 0.4);
+    box-shadow: 0 2px 12px rgba(15, 23, 42, 0.05);
 }
 
-/* Branch order: product info table (name / BROCODE / price) */
-.product-card-info-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.88rem;
-    margin: 0 0 8px 0;
-    table-layout: fixed;
+section[data-testid="stMain"] [data-baseweb="select"] > div {
+    border-radius: 10px !important;
 }
-.product-card-info-table td {
-    border: 1px solid #0f172a;
-    padding: 8px 10px;
-    vertical-align: middle;
+section[data-testid="stMain"] hr {
+    margin: 1.5rem 0;
+    border: none;
+    height: 1px;
+    background: linear-gradient(
+        90deg,
+        transparent,
+        rgba(148, 163, 184, 0.55) 15%,
+        rgba(59, 130, 246, 0.35) 50%,
+        rgba(148, 163, 184, 0.55) 85%,
+        transparent
+    );
+}
+
+/* Alerts & notices */
+section[data-testid="stMain"] div[data-testid="stAlert"] {
+    border-radius: 12px !important;
+    border: 1px solid rgba(148, 163, 184, 0.35) !important;
+    box-shadow: 0 2px 12px rgba(15, 23, 42, 0.06);
+}
+
+/* Expanders */
+section[data-testid="stMain"] details,
+section[data-testid="stMain"] div[data-testid="stExpander"] {
+    border-radius: 12px !important;
+    border: 1px solid rgba(148, 163, 184, 0.35) !important;
+    background: rgba(248, 250, 252, 0.72) !important;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+}
+section[data-testid="stMain"] details summary {
+    font-weight: 600 !important;
+    color: #0f172a !important;
+}
+
+/* Tabs / pills / captions — calmer hierarchy */
+section[data-testid="stMain"] [data-testid="stCaptionContainer"] {
+    color: #64748b !important;
+}
+
+/* Radio groups (module switchers) */
+section[data-testid="stMain"] [data-testid="stRadio"] label {
+    font-weight: 500 !important;
+}
+
+/* “Current page” strip under sidebar (see _render_active_page_hint) */
+.active-page-hint {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.75rem;
+    margin: 4px 0 14px 0;
+    padding: 10px 14px;
+    border-radius: 12px;
+    background: linear-gradient(
+        120deg,
+        rgba(255, 255, 255, 0.92) 0%,
+        rgba(241, 245, 249, 0.88) 100%
+    );
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-left: 4px solid var(--hint-accent, #2563eb);
+    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
+}
+.active-page-hint__k {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #64748b;
+}
+.active-page-hint__v {
+    font-size: 14px;
+    font-weight: 700;
+    color: #0f172a;
+    letter-spacing: -0.01em;
+}
+
+/* ----- st.container(border=True): soft shadow + rounded corners ----- */
+section[data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 12px !important;
+    overflow: hidden;
+    box-shadow:
+        0 1px 2px rgba(15, 23, 42, 0.04),
+        0 4px 18px rgba(15, 23, 42, 0.06);
+    transition: box-shadow 0.22s ease, transform 0.22s ease;
+}
+section[data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:hover {
+    box-shadow:
+        0 2px 6px rgba(15, 23, 42, 0.08),
+        0 12px 28px rgba(15, 23, 42, 0.12);
+}
+
+/* 分店下单商品卡片：默认 border 容器用了 overflow:hidden，会干扰横向 flex，改为可见 */
+section[data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) {
+    overflow: visible !important;
+}
+
+/* ----- Branch order browse: product card（仅缩略图列居中，勿用 :first-child 以免误伤「箱数」列）
+ * Streamlit ≥1.40 列节点为 data-testid="stColumn"；旧版为 "column"，下列双写兼容。
+ * ----- */
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="column"]:has(.product-card-thumb-spacer-top),
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stColumn"]:has(.product-card-thumb-spacer-top) {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    padding: 10px 6px 12px 8px;
+}
+.product-card-thumb-spacer-top { height: 10px; }
+.product-card-thumb-spacer-bottom { height: 12px; }
+.product-card-thumb-ph {
+    width: 112px;
+    height: 112px;
+    border-radius: 12px;
+    background: linear-gradient(145deg, #f1f5f9 0%, #e8eef5 100%);
+    border: 1px dashed #cbd5e1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2rem;
+    color: #94a3b8;
+}
+.product-card-title {
+    font-size: 1.12rem;
+    font-weight: 750;
+    color: #0f172a;
+    line-height: 1.38;
+    margin: 0 0 12px 0;
+    letter-spacing: -0.02em;
+}
+.product-card-meta {
+    font-size: 0.84rem;
+    color: #64748b;
+    line-height: 1.55;
+    margin: 0 0 14px 0;
+}
+.product-card-meta--empty {
+    margin-bottom: 8px;
+}
+.product-card-stock {
+    font-size: 0.88rem;
+    color: #334155;
+    background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin: 0 0 14px 0;
     line-height: 1.45;
 }
-.product-card-info-label {
-    width: 34%;
-    font-weight: 600;
-    color: #334155;
-    background: #f8fafc;
+.product-card-batch {
+    font-size: 0.82rem;
+    color: #047857;
+    background: rgba(16, 185, 129, 0.09);
+    border: 1px solid rgba(16, 185, 129, 0.25);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin: 0 0 14px 0;
+    line-height: 1.45;
 }
-.product-card-info-value {
-    color: #0f172a;
-    word-break: break-word;
+.product-card-qty-section {
+    margin-top: 2px;
+    padding-top: 16px;
+    border-top: 1px solid rgba(148, 163, 184, 0.4);
+    margin-bottom: 8px;
+}
+.product-card-qty-section-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #64748b;
+}
+
+/*
+ * 分店下单商品卡片 · 手机端：禁止 Streamlit 把列叠成上下。
+ * — 上图左、名称/编号/价格/库存永远在图右侧；
+ * — 「订购数量」下箱数 / 个数同一行左右排列。
+ */
+section[data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stHorizontalBlock"],
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stHorizontalBlock"] {
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    flex-direction: row !important;
+    align-items: flex-start !important;
+    gap: 0.5rem !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stHorizontalBlock"] > [data-testid="column"],
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+    min-width: 0 !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="column"]:has(.product-card-thumb-spacer-top),
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stColumn"]:has(.product-card-thumb-spacer-top) {
+    flex: 0 0 118px !important;
+    max-width: 128px !important;
+    width: 118px !important;
+    box-sizing: border-box !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="column"]:has(.product-card-title),
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stColumn"]:has(.product-card-title) {
+    flex: 1 1 auto !important;
+}
+/* 订购数量行：两列等分（排除左侧缩略图列与右侧主信息列） */
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stHorizontalBlock"] > [data-testid="column"]:not(:has(.product-card-thumb-spacer-top)):not(:has(.product-card-title)),
+[data-testid="stVerticalBlockBorderWrapper"]:has(.product-card-title) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:not(:has(.product-card-thumb-spacer-top)):not(:has(.product-card-title)) {
+    flex: 1 1 0 !important;
+}
+
+@media (max-width: 480px) {
+    .product-card-title { font-size: 1.02rem; margin-bottom: 8px !important; }
+    .product-card-meta { font-size: 0.8rem; margin-bottom: 8px !important; }
+    .product-card-stock { padding: 8px 10px; margin-bottom: 10px !important; font-size: 0.84rem; }
+    .product-card-qty-section { padding-top: 12px; }
+}
+
+/* Arrival notice item list — plain text only (no Markdown # → heading) */
+.arrival-items-plain {
+    margin: 0.4rem 0 0 0;
+    padding-left: 1.2rem;
+    font-size: 0.95rem;
+    line-height: 1.55;
     font-weight: 500;
+    color: #334155;
+}
+.arrival-items-plain li {
+    margin-bottom: 0.35rem;
 }
 </style>
 """
@@ -2971,37 +4786,48 @@ def render_section_title(title: str) -> None:
 # =========================================================================
 # UI HELPERS
 # =========================================================================
-def render_header(context_label: str = "") -> None:
-    unread_msg = count_unread_notifications()
-    ticker = header_ticker_text()
-    badge = ""
-    ctx = f'<div class="title-context">{context_label}</div>' if context_label else ""
+def render_header(
+    context_label: str = "",
+    *,
+    show_brand_banner: bool = False,
+) -> None:
+    """Optional login banner only. Post-login chrome lives in the sidebar.
+
+    Streamlit's top-right ⋮ menu cannot host custom actions (EN/中文); language
+    is in ``render_sidebar_lang_switch`` instead.
+    """
+    if not show_brand_banner:
+        return
+    esc_ctx = html.escape(context_label) if context_label else ""
+    ctx = f'<div class="title-context">{esc_ctx}</div>' if esc_ctx else ""
     st.markdown(
         f"""
         <div class="sunshine-header">
             <div>
-                <div class="title-main">☀️ {t('app_brand')}{badge}</div>
-                <div class="title-sub">{t('app_subtitle')}</div>
+                <div class="title-main">☀️ {html.escape(t('app_brand'))}</div>
+                <div class="title-sub">{html.escape(t('app_subtitle'))}</div>
             </div>
             {ctx}
         </div>
         """,
         unsafe_allow_html=True,
     )
-    role = st.session_state.get("role")
-    if role in (Role.BRANCH, Role.WAREHOUSE, Role.ADMIN):
-        c1, c2 = st.columns([1, 5])
-        with c1:
-            if st.button(
-                f"🔔 {t('nav_messages')} ({unread_msg})",
-                key="hdr_msg_jump",
-                use_container_width=True,
-            ):
-                st.session_state.page = "messages"
-                st.rerun()
-        with c2:
-            if ticker:
-                st.caption(f"📣 {ticker}")
+
+
+def render_sidebar_lang_switch() -> None:
+    """EN / 中文 in the sidebar + compact ticker (replaces the old top bar)."""
+    c1, c2 = st.sidebar.columns(2)
+    with c1:
+        if st.button("EN", key="lang_en_sb", use_container_width=True):
+            st.session_state.lang = "en"
+            st.rerun()
+    with c2:
+        if st.button("中文", key="lang_zh_sb", use_container_width=True):
+            st.session_state.lang = "zh"
+            st.rerun()
+    tick = header_ticker_text()
+    if tick:
+        st.sidebar.caption(f"📣 {tick}")
 
 
 def render_lang_switch() -> None:
@@ -3025,9 +4851,28 @@ def status_pill(status: str) -> str:
 
 def logout_button(key: str = "logout_btn") -> None:
     if st.button(f"🚪 {t('logout')}", key=key, use_container_width=True):
+        try:
+            audit_write(
+                "logout",
+                extra={"page": st.session_state.get("page")},
+            )
+        except Exception:
+            pass
         lang = st.session_state.get("lang", "en")
         last_role = st.session_state.get("role")
         last_branch = st.session_state.get("branch")
+        logout_aid = st.session_state.get("account_id")
+        logout_br = st.session_state.get("branch")
+        if (
+            last_role == Role.BRANCH
+            and logout_aid is not None
+            and logout_br
+            and str(logout_br).strip()
+        ):
+            try:
+                _delete_branch_cart_draft(int(logout_aid), str(logout_br).strip())
+            except Exception:
+                pass
         st.session_state.clear()
         st.session_state.lang = lang
         if last_role in (Role.BRANCH, Role.WAREHOUSE, Role.ADMIN):
@@ -3051,17 +4896,194 @@ def init_session() -> None:
         "last_branch": None,
         "ai_chat": [],
         "ai_last_call_ts": 0.0,
+        "account_id": None,
+        "account_username": None,
+        "account_perms": [],
+        "branch_apply_submitted": False,
+        "login_branch_context": None,
+        "wh_supplier_sent": False,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
+def _query_param_first(key: str) -> str | None:
+    """Single query value for Streamlit query_params (string or one-element list)."""
+    try:
+        v = st.query_params.get(key)
+    except Exception:
+        return None
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return str(v[0]).strip() if v else None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _parent_window_history_js(mode: str, page_key: str) -> None:
+    """Update the real browser URL (parent) so the device back key can pop in-app pages."""
+    import json
+
+    m = "push" if mode == "push" else "replace"
+    pk = json.dumps(page_key)
+    mode_j = json.dumps(m)
+    key_q = json.dumps(URL_PAGE_QUERY_KEY)
+    html = f"""
+<script>
+(function() {{
+  try {{
+    var w = window.parent;
+    var p = {pk};
+    var mode = {mode_j};
+    var qk = {key_q};
+    var u = new URL(w.location.href);
+    u.searchParams.set(qk, p);
+    if (mode === "push") {{
+      w.history.pushState({{ sunshine_app: 1, p: p }}, "", u.toString());
+    }} else {{
+      w.history.replaceState({{ sunshine_app: 1, p: p }}, "", u.toString());
+    }}
+    if (!w.__sunshine_popstate_ok) {{
+      w.__sunshine_popstate_ok = true;
+      w.addEventListener("popstate", function () {{
+        w.location.reload();
+      }});
+    }}
+  }} catch (e) {{}}
+}})();
+</script>
+"""
+    try:
+        components.html(html, height=0, width=0)
+    except Exception:
+        pass
+
+
+def _apply_url_page_to_session(role: str, allowed: frozenset[str]) -> None:
+    """When the user presses the device back button, URL ?p= changes — honor it."""
+    p = _query_param_first(URL_PAGE_QUERY_KEY)
+    if not p or p not in allowed:
+        return
+    if role == Role.BRANCH:
+        pmap = {
+            "order": "order",
+            "order_done": "order",
+            "my_orders": "my_orders",
+            "my_short": "my_short",
+            "messages": "messages",
+            "ai": "ai",
+        }
+        need = pmap.get(p, "order")
+        if not has_branch_perm(need):
+            return
+    st.session_state.page = p
+
+
+def _sync_browser_history_stack(
+    *,
+    allowed: frozenset[str],
+    current_page: str,
+    nav_from_sidebar: bool,
+) -> None:
+    """Push/replace parent history so back returns to the previous in-app screen."""
+    if current_page not in allowed:
+        return
+    last = st.session_state.get("_hist_last_p")
+    if nav_from_sidebar:
+        if last is None:
+            _parent_window_history_js("replace", current_page)
+        elif last != current_page:
+            _parent_window_history_js("push", current_page)
+        st.session_state._hist_last_p = current_page
+        return
+    if last is None:
+        _parent_window_history_js("replace", current_page)
+        st.session_state._hist_last_p = current_page
+        return
+    if last != current_page:
+        st.session_state._hist_last_p = current_page
+
+
+def _branch_nav_allowed_keys(nav_items: list[tuple[str, str]]) -> frozenset[str]:
+    keys = {k for k, _ in nav_items}
+    keys.add("order_done")
+    return frozenset(keys)
+
+
+def _set_session_page_for_app_nav(page_key: str) -> None:
+    """Use when changing `page` from buttons (not sidebar) so URL/history stay aligned."""
+    st.session_state.page = page_key
+    st.session_state._nav_from_sidebar = True
+    try:
+        st.query_params[URL_PAGE_QUERY_KEY] = page_key
+    except Exception:
+        pass
+
+
+WAREHOUSE_PAGE_KEYS = frozenset({
+    "pending", "short_in", "history", "supplier", "inventory", "messages", "ai",
+})
+ADMIN_PAGE_KEYS = frozenset({
+    "dashboard", "shelf_mobile", "accounts", "audit", "inventory",
+    "export", "backup", "messages", "ai",
+})
+
+
 def is_authenticated() -> bool:
     role = st.session_state.get("role")
     if role == Role.BRANCH:
-        return bool(st.session_state.get("branch"))
+        if not st.session_state.get("branch"):
+            return False
+        if st.session_state.get("account_id") is None:
+            return False
+        return True
     return role in (Role.WAREHOUSE, Role.ADMIN)
+
+
+def branch_effective_perms() -> frozenset[str]:
+    """Permissions for the current branch session (account-backed only)."""
+    if st.session_state.get("role") != Role.BRANCH:
+        return frozenset(BRANCH_PERM_CODES)
+    return frozenset(st.session_state.get("account_perms") or [])
+
+
+def has_branch_perm(perm: str) -> bool:
+    return perm in branch_effective_perms()
+
+
+def first_allowed_branch_page() -> str:
+    for p, _ in BRANCH_PERM_ORDER:
+        if has_branch_perm(p):
+            return p
+    return BRANCH_PERM_ORDER[0][0]
+
+
+def branch_perm_label(code: str) -> str:
+    for p, key in BRANCH_PERM_ORDER:
+        if p == code:
+            return t(key)
+    return code
+
+
+def ensure_branch_page_allowed(page_key: str) -> None:
+    pmap = {
+        "order": "order",
+        "order_done": "order",
+        "my_orders": "my_orders",
+        "my_short": "my_short",
+        "messages": "messages",
+        "ai": "ai",
+    }
+    need = pmap.get(page_key, "order")
+    if has_branch_perm(need):
+        return
+    fallback = first_allowed_branch_page()
+    if st.session_state.get("page") != fallback:
+        _set_session_page_for_app_nav(fallback)
+        st.warning(t("acct_no_access"))
+        st.rerun()
 
 
 # =========================================================================
@@ -3094,16 +5116,36 @@ def page_pick_language() -> None:
 
 
 def page_login() -> None:
-    render_header()
-    render_lang_switch()
-    render_section_title(t("select_role"))
-
     pending = st.session_state.get("pending_role")
     if pending is None and st.session_state.get("last_role") in (
         Role.BRANCH, Role.WAREHOUSE, Role.ADMIN
     ):
         pending = st.session_state.get("last_role")
         st.session_state.pending_role = pending
+
+    if pending == Role.BRANCH and st.session_state.get("branch_apply_submitted"):
+        render_header(show_brand_banner=True)
+        render_lang_switch()
+        render_page_heading(t("acct_apply_done_title"), None)
+        bctx = st.session_state.get("login_branch_context")
+        if bctx in BRANCHES:
+            st.markdown(
+                f"**{html.escape(t('branch'))}:** {html.escape(bctx)}"
+            )
+        st.success(t("acct_apply_ok"))
+        if st.button(
+            t("acct_back_branch_options"),
+            type="primary",
+            key="acct_apply_done_back",
+            use_container_width=True,
+        ):
+            st.session_state.branch_apply_submitted = False
+            st.rerun()
+        return
+
+    render_header(show_brand_banner=True)
+    render_lang_switch()
+    render_section_title(t("select_role"))
     if st.session_state.get("last_role"):
         last_role_label = {
             Role.BRANCH: t("role_branch"),
@@ -3123,48 +5165,154 @@ def page_login() -> None:
         st.rerun()
     if c2.button(t("role_warehouse"), use_container_width=True):
         st.session_state.pending_role = Role.WAREHOUSE
+        st.session_state.branch_apply_submitted = False
+        st.session_state.login_branch_context = None
         st.rerun()
     if c3.button(t("role_admin"), use_container_width=True):
         st.session_state.pending_role = Role.ADMIN
+        st.session_state.branch_apply_submitted = False
+        st.session_state.login_branch_context = None
         st.rerun()
 
     if pending == Role.BRANCH:
         st.divider()
-        render_section_title(t("select_branch"))
-        last_branch = st.session_state.get("last_branch")
-        if last_branch in BRANCHES:
-            st.caption(f"⭐ {t('use_recent_branch')}: {last_branch}")
-        cols = st.columns(2)
-        for i, branch in enumerate(BRANCHES):
-            label = f"⭐ {branch}" if branch == last_branch else branch
-            with cols[i % 2]:
-                if st.button(label, key=f"branch_btn_{i}", use_container_width=True):
-                    st.session_state.role = Role.BRANCH
-                    st.session_state.branch = branch
-                    st.session_state.last_role = Role.BRANCH
-                    st.session_state.last_branch = branch
-                    st.session_state.page = "order"
-                    st.session_state.pop("pending_role", None)
-                    st.rerun()
+        portal = st.session_state.get("login_branch_context")
+        if portal not in BRANCHES:
+            render_section_title(t("acct_enter_store_title"))
+            st.caption(t("acct_enter_store_hint"))
+            last_branch = st.session_state.get("last_branch")
+            cols = st.columns(2)
+            for i, branch in enumerate(BRANCHES):
+                label = f"⭐ {branch}" if branch == last_branch else branch
+                with cols[i % 2]:
+                    if st.button(
+                        label, key=f"portal_pick_{i}", use_container_width=True
+                    ):
+                        st.session_state.login_branch_context = branch
+                        st.rerun()
+            return
+
+        st.markdown(
+            f"<div style='margin-bottom:0.75rem;'>"
+            f"<span style='font-size:1.05rem;font-weight:650;'>{html.escape(t('acct_current_store'))}: "
+            f"</span><span style='font-size:1.05rem;font-weight:800;color:#0d47a1;'>"
+            f"{html.escape(portal)}</span></div>",
+            unsafe_allow_html=True,
+        )
+        if st.button(t("acct_change_store"), key="portal_change_store"):
+            st.session_state.login_branch_context = None
+            st.session_state.branch_apply_submitted = False
+            st.rerun()
+
+        tabs = st.tabs([t("acct_tab_login"), t("acct_tab_apply")])
+
+        with tabs[0]:
+            st.caption(t("acct_login_hint"))
+            bu = st.text_input(t("acct_username"), key="branch_acct_user")
+            bpw = st.text_input(t("password"), type="password", key="branch_acct_pw")
+            if st.button(t("login"), type="primary", key="branch_acct_login"):
+                code, row = account_try_login(bu, bpw)
+                if code == "ok" and row is not None:
+                    if row["branch"] != portal:
+                        st.error(t("acct_wrong_branch"))
+                    else:
+                        st.session_state.role = Role.BRANCH
+                        st.session_state.branch = row["branch"]
+                        st.session_state.account_id = int(row["id"])
+                        st.session_state.account_username = row["username"]
+                        st.session_state.account_perms = _parse_permissions_json(
+                            row["permissions"]
+                        )
+                        st.session_state.last_role = Role.BRANCH
+                        st.session_state.last_branch = row["branch"]
+                        _set_session_page_for_app_nav(first_allowed_branch_page())
+                        st.session_state.login_branch_context = None
+                        st.session_state.pop("pending_role", None)
+                        audit_write(
+                            "login",
+                            branch=row["branch"],
+                            extra={"method": "branch_account", "account_id": int(row["id"])},
+                        )
+                        st.rerun()
+                elif code == "pending":
+                    st.warning(t("acct_pending_login"))
+                elif code == "rejected":
+                    st.error(t("acct_rejected_login"))
+                elif code == "no_permissions":
+                    st.error(t("acct_perm_need_admin"))
+                else:
+                    st.error(t("wrong_pw"))
+
+        with tabs[1]:
+            st.markdown(
+                f"**{html.escape(t('branch'))}:** {html.escape(portal)}"
+            )
+            auser = st.text_input(t("acct_username"), key="acct_apply_user")
+            dname = st.text_input(t("acct_display_name"), key="acct_apply_dname")
+            phone = st.text_input(t("acct_phone"), key="acct_apply_phone")
+            p1 = st.text_input(t("acct_password"), type="password", key="acct_apply_p1")
+            p2 = st.text_input(t("acct_password2"), type="password", key="acct_apply_p2")
+            if st.button(t("acct_apply_submit"), type="primary", key="acct_apply_submit"):
+                if p1 != p2:
+                    st.error(t("acct_pw_mismatch"))
+                else:
+                    ok, err_k = account_insert_application(
+                        auser, p1, portal, dname, phone
+                    )
+                    if ok:
+                        st.session_state.branch_apply_submitted = True
+                        st.rerun()
+                    else:
+                        st.error(t(err_k))
 
     elif pending == Role.WAREHOUSE:
         _password_login(Role.WAREHOUSE, WAREHOUSE_PASSWORD, default_page="pending")
 
     elif pending == Role.ADMIN:
-        _password_login(Role.ADMIN, ADMIN_PASSWORD, default_page="dashboard")
+        _password_login(
+            Role.ADMIN,
+            ADMIN_PASSWORD,
+            default_page="dashboard",
+            phone_allowlist=_admin_phone_allowlist(),
+        )
 
 
-def _password_login(role: str, expected: str, default_page: str) -> None:
+def _password_login(
+    role: str,
+    expected: str,
+    default_page: str,
+    *,
+    phone_allowlist: set[str] | None = None,
+) -> None:
     st.divider()
     label = t("role_warehouse") if role == Role.WAREHOUSE else t("role_admin")
     render_section_title(label)
+    need_phone = bool(phone_allowlist)
+    if need_phone:
+        st.caption(t("admin_login_phone_hint"))
+        phone_in = st.text_input(
+            t("admin_phone"),
+            key=f"phone_{role}",
+            placeholder="13800000000",
+        )
+    else:
+        phone_in = ""
     pw = st.text_input(t("password"), type="password", key=f"pw_{role}")
     if st.button(t("login"), type="primary", key=f"login_{role}"):
+        if need_phone:
+            got = _normalize_phone_digits(phone_in)
+            if not got or got not in (phone_allowlist or set()):
+                st.error(t("wrong_phone"))
+                return
         if pw == expected:
             st.session_state.role = role
             st.session_state.last_role = role
-            st.session_state.page = default_page
+            _set_session_page_for_app_nav(default_page)
             st.session_state.pop("pending_role", None)
+            extra: dict = {"method": "shared_password", "portal_role": role}
+            if need_phone:
+                extra["method"] = "admin_phone_password"
+            audit_write("login", extra=extra)
             st.rerun()
         else:
             st.error(t("wrong_pw"))
@@ -3265,6 +5413,10 @@ def page_ai_assistant() -> None:
                     chat.append({"q": q, "a": ans, "ok": ok, "ts": now_str()})
         st.rerun()
 
+    # Context toggle must come before quick prompts so one-click shortcuts
+    # read the same value as manual asks.
+    with_ctx = st.checkbox(t("ai_with_ctx"), value=True, key="ai_with_ctx")
+
     q1, q2, q3 = st.columns([2, 2, 1])
     with q1:
         quick_shortage = st.button(
@@ -3288,11 +5440,6 @@ def page_ai_assistant() -> None:
         t("ai_q_dispatch"), use_container_width=True, key="ai_q_dispatch_btn",
         disabled=bool(st.session_state.get("_ai_pending")),
     )
-    with_ctx = st.checkbox(t("ai_with_ctx"), value=True, key="ai_with_ctx")
-    user_q = st.text_area(
-        t("ai_question"), key="ai_input", height=110,
-        disabled=bool(st.session_state.get("_ai_pending")),
-    )
 
     chosen_quick = ""
     if quick_shortage:
@@ -3302,7 +5449,19 @@ def page_ai_assistant() -> None:
     elif quick_dispatch:
         chosen_quick = t("ai_q_dispatch")
     if chosen_quick:
-        user_q = chosen_quick
+        # Previous code only overwrote a Python variable; the text_area widget
+        # state stayed empty, so "Ask AI" submitted blank. Queue same as manual.
+        st.session_state["ai_input"] = chosen_quick
+        st.session_state["_ai_pending"] = {
+            "q": chosen_quick,
+            "with_ctx": bool(with_ctx),
+        }
+        st.rerun()
+
+    user_q = st.text_area(
+        t("ai_question"), key="ai_input", height=110,
+        disabled=bool(st.session_state.get("_ai_pending")),
+    )
 
     ask_disabled = bool(st.session_state.get("_ai_pending"))
     if st.button(
@@ -3374,6 +5533,23 @@ def page_messages() -> None:
                     st.rerun()
 
 
+def _render_arrival_items_list(items_text: str) -> None:
+    """Render arrival SKU lines with uniform typography.
+
+    Using ``st.markdown`` with ``- {line}`` breaks when a line starts with ``#``
+    (Markdown headings) or other MD syntax — sizes become inconsistent.
+    """
+    lines = [ln.strip() for ln in (items_text or "").splitlines() if ln.strip()]
+    if not lines:
+        return
+    st.markdown(
+        "<ul class='arrival-items-plain'>"
+        + "".join(f"<li>{html.escape(ln)}</li>" for ln in lines)
+        + "</ul>",
+        unsafe_allow_html=True,
+    )
+
+
 def _render_active_arrival_banner() -> None:
     row = get_active_stock_arrival()
     if row is None:
@@ -3388,53 +5564,14 @@ def _render_active_arrival_banner() -> None:
         if notice:
             st.info(notice)
         if items:
-            lines = [ln.strip() for ln in items.splitlines() if ln.strip()]
-            if lines:
-                st.markdown("\n".join(f"- {ln}" for ln in lines))
+            _render_arrival_items_list(items)
         st.divider()
 
 
-def page_admin_arrivals() -> None:
-    render_page_heading(f"📦 {t('nav_arrivals')}")
-    if st.session_state.get("_arrival_reset_editor"):
-        st.session_state["arrival_items_editor"] = ""
-        st.session_state["arrival_pick_selected"] = []
-        st.session_state.pop("_arrival_reset_editor", None)
-    current = get_active_stock_arrival()
-    render_section_title(t("arrival_current"))
-    if current is None:
-        st.info(t("arrival_none"))
-    else:
-        st.markdown(f"**{(current['title'] or '').strip() or t('nav_arrivals')}**")
-        st.caption(str(current["created_at"])[:16])
-        if (current["notice"] or "").strip():
-            st.write((current["notice"] or "").strip())
-        if (current["items_text"] or "").strip():
-            st.markdown(
-                "\n".join(
-                    f"- {ln.strip()}"
-                    for ln in str(current["items_text"]).splitlines()
-                    if ln.strip()
-                )
-            )
-
-    st.divider()
-    render_section_title(t("arrival_publish"))
-    st.caption("可先搜索并选择商品，再一键追加到清单。")
-    st.caption("搜索商品（名称/条码/编号）")
-
-    pick_kw = st.text_input(
-        "",
-        key="arrival_pick_kw",
-        placeholder=t("search_product"),
-        label_visibility="collapsed",
-    )
-    pick_df = (
-        search_products(pick_kw, limit=120)
-        if pick_kw else load_products(_products_mtime(), _inventory_version()).head(120)
-    )
+def _arrival_product_labels_from_df(df: pd.DataFrame) -> list[str]:
+    """Build one label per row for arrival pickers (name + code + barcode)."""
     options: list[str] = []
-    for _, r in pick_df.iterrows():
+    for _, r in df.iterrows():
         nm = str(r.get("Name", "") or "").strip()
         if not nm:
             continue
@@ -3446,27 +5583,115 @@ def page_admin_arrivals() -> None:
         if bc:
             parts.append(f"({bc})")
         options.append(" ".join(parts))
-    selected_items = st.multiselect(
-        "选择产品追加到到货清单",
-        options=options,
-        key="arrival_pick_selected",
+    return options
+
+
+@st.dialog("选择到货商品 · Pick products")
+def _dialog_arrival_pick_products() -> None:
+    """Modal: search / multi-select products and append lines to arrival_items_editor."""
+    st.caption(t("arrival_pick_dialog_hint"))
+    st.text_input(
+        t("search_product"),
+        key="arrival_dlg_search",
+        placeholder=t("search_product"),
     )
-    if st.button("追加所选产品", key="arrival_append_selected"):
+    qstrip = (st.session_state.get("arrival_dlg_search") or "").strip()
+    pick_df = (
+        search_products(qstrip, limit=200)
+        if qstrip
+        else load_products(
+            _products_mtime(), _inventory_version(), _price_version()
+        ).head(200)
+    )
+    options = _arrival_product_labels_from_df(pick_df)
+    if not options:
+        st.info(t("no_results"))
+    else:
+        st.multiselect(
+            t("arrival_pick_dialog_select"),
+            options=options,
+            key="arrival_dlg_multiselect",
+        )
+    c1, c2 = st.columns(2)
+    with c1:
+        do_add = st.button(
+            t("arrival_pick_confirm"),
+            type="primary",
+            use_container_width=True,
+            key="arrival_dlg_btn_ok",
+        )
+    with c2:
+        do_close = st.button(
+            t("arrival_pick_cancel"),
+            use_container_width=True,
+            key="arrival_dlg_btn_close",
+        )
+    if do_add:
+        picked = list(st.session_state.get("arrival_dlg_multiselect") or [])
+        if not picked:
+            st.warning(t("arrival_pick_empty_sel"))
+            return
         existing = str(st.session_state.get("arrival_items_editor", "") or "")
         existing_lines = [ln.strip() for ln in existing.splitlines() if ln.strip()]
         seen = set(existing_lines)
         appended = []
-        for item in selected_items:
+        for item in picked:
             if item not in seen:
                 seen.add(item)
                 appended.append(item)
         if appended:
             merged = existing_lines + appended
             st.session_state["arrival_items_editor"] = "\n".join(merged)
-            st.success(f"已追加 {len(appended)} 个商品")
+            st.session_state["_arrival_pick_flash"] = t("arrival_pick_appended").format(
+                n=len(appended)
+            )
         else:
-            st.info("没有新增商品可追加")
+            st.session_state["_arrival_pick_flash"] = t("arrival_pick_nothing_new")
+        st.session_state["_arrival_dlg_open"] = False
         st.rerun()
+    if do_close:
+        st.session_state["_arrival_dlg_open"] = False
+        st.rerun()
+
+
+def page_admin_arrivals() -> None:
+    render_page_heading(f"📦 {t('nav_arrivals')}")
+    if st.session_state.get("_arrival_reset_editor"):
+        st.session_state["arrival_items_editor"] = ""
+        st.session_state.pop("arrival_pick_selected", None)
+        st.session_state.pop("arrival_pick_kw", None)
+        st.session_state.pop("arrival_dlg_multiselect", None)
+        st.session_state.pop("arrival_dlg_search", None)
+        st.session_state["_arrival_dlg_open"] = False
+        st.session_state.pop("_arrival_reset_editor", None)
+    current = get_active_stock_arrival()
+    render_section_title(t("arrival_current"))
+    if current is None:
+        st.info(t("arrival_none"))
+    else:
+        st.markdown(f"**{(current['title'] or '').strip() or t('nav_arrivals')}**")
+        st.caption(str(current["created_at"])[:16])
+        if (current["notice"] or "").strip():
+            st.write((current["notice"] or "").strip())
+        if (current["items_text"] or "").strip():
+            _render_arrival_items_list(str(current["items_text"]))
+
+    st.divider()
+    render_section_title(t("arrival_publish"))
+    pick_flash = st.session_state.pop("_arrival_pick_flash", None)
+    if pick_flash:
+        st.success(pick_flash)
+    st.caption(t("arrival_publish_hint_dialog"))
+    if st.button(
+        t("arrival_pick_open_btn"),
+        key="arrival_open_pick_dlg",
+        type="primary",
+    ):
+        st.session_state["_arrival_dlg_open"] = True
+        st.session_state.pop("arrival_dlg_multiselect", None)
+        st.session_state.pop("arrival_dlg_search", None)
+    if st.session_state.get("_arrival_dlg_open"):
+        _dialog_arrival_pick_products()
 
     if "arrival_items_editor" not in st.session_state:
         st.session_state["arrival_items_editor"] = ""
@@ -3592,9 +5817,157 @@ def _clear_qty_inputs() -> None:
         del st.session_state[k]
 
 
+def _fmt_branch_catalog_price(v: object) -> str:
+    """分店下单卡片上的价格展示：整数不显示小数尾随零。"""
+    try:
+        x = float(v or 0)
+    except (TypeError, ValueError):
+        return "0"
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    return f"{x:.2f}"
+
+
+def _render_branch_product_card(row: pd.Series) -> None:
+    """Product row for branch order browse: thumbnail left, stacked info + qty right."""
+    img_path = get_product_image_path(
+        str(row.get("ItemCode", "")),
+        str(row.get("Barcode", "")),
+    )
+    item_code = str(row.get("ItemCode", ""))
+    barcode = str(row.get("Barcode", ""))
+    name = str(row["Name"])
+    pid = _product_id(item_code, barcode, name)
+    ct_key, pc_key = _qty_widget_keys(pid)
+
+    _register_product(pid, {
+        "item_code": item_code,
+        "barcode":   barcode,
+        "name":      name,
+        "unit":      str(row.get("Unit", "")),
+        "price":     float(row.get("Price", 0) or 0),
+        "is_manual": 0,
+    })
+    init_ct, init_pc = _get_qty(pid)
+    if ct_key not in st.session_state:
+        st.session_state[ct_key] = init_ct
+    if pc_key not in st.session_state:
+        st.session_state[pc_key] = init_pc
+
+    # 使用横向 container 代替 st.columns，避免 Streamlit 1.56+ 默认 flex-wrap 在窄屏叠行；
+    # key 仅用于稳定身份（CSS 仍用 :has(.product-card-title) 命中整张卡片）。
+    _card_key = "bc_" + hashlib.sha256(pid.encode("utf-8")).hexdigest()[:28]
+    with st.container(border=True, key=_card_key):
+        with st.container(
+            horizontal=True,
+            gap="medium",
+            vertical_alignment="top",
+        ):
+            with st.container(width=128):
+                st.markdown(
+                    '<div class="product-card-thumb-spacer-top"></div>',
+                    unsafe_allow_html=True,
+                )
+                if img_path is not None:
+                    st.image(str(img_path), width=112)
+                else:
+                    st.markdown(
+                        '<div class="product-card-thumb-ph"><span>📦</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(
+                    '<div class="product-card-thumb-spacer-bottom"></div>',
+                    unsafe_allow_html=True,
+                )
+
+            with st.container():
+                ic_raw = (item_code or "").strip()
+                ic_core = ic_raw.lstrip("#").strip()
+                if ic_core:
+                    title_line = f"商品名：#{ic_core} {name}"
+                else:
+                    title_line = f"商品名：{name}"
+                sku_line = (barcode or "").strip() or ic_raw
+                st.markdown(
+                    f'<div class="product-card-title">'
+                    f"{html.escape(title_line)}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f'<div class="product-card-meta">'
+                    f"商品编号：{html.escape(sku_line) if sku_line else '—'}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                price_txt = _fmt_branch_catalog_price(row.get("Price", 0))
+                st.markdown(
+                    f'<div class="product-card-meta">'
+                    f"商品价格：{html.escape(price_txt)}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                if bool(row.get("_has_stock_info", False)):
+                    stock_ct = int(float(row.get("StockCartons", 0) or 0))
+                    stock_pc = int(float(row.get("StockPcs", 0) or 0))
+                    stock_total = int(float(row.get("StockTotal", 0) or 0))
+                    if stock_ct > 0 or stock_pc > 0:
+                        stock_line = (
+                            f"🏬 库存：📦 {stock_ct} 箱 · 🔢 {stock_pc} 个"
+                        )
+                    else:
+                        stock_line = f"🏬 库存：{stock_total}"
+                    st.markdown(
+                        f'<div class="product-card-stock">{html.escape(stock_line)}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                prev_ct, prev_pc = _get_qty(pid)
+                if prev_ct > 0 or prev_pc > 0:
+                    batch_txt = (
+                        f"✓ {t('saved_for_batch')}: 📦 {prev_ct} · 🔢 {prev_pc}"
+                    )
+                    st.markdown(
+                        f'<div class="product-card-batch">{html.escape(batch_txt)}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown(
+                    '<div class="product-card-qty-section">'
+                    f'<span class="product-card-qty-section-title">'
+                    f"{html.escape(t('order_qty_heading'))}</span></div>",
+                    unsafe_allow_html=True,
+                )
+                with st.container(
+                    horizontal=True,
+                    gap="medium",
+                    vertical_alignment="top",
+                ):
+                    with st.container():
+                        st.number_input(
+                            t("cartons"),
+                            min_value=0,
+                            step=1,
+                            key=ct_key,
+                            on_change=_on_qty_change,
+                            args=(pid, "ct"),
+                        )
+                    with st.container():
+                        st.number_input(
+                            t("each_pcs"),
+                            min_value=0,
+                            step=1,
+                            key=pc_key,
+                            on_change=_on_qty_change,
+                            args=(pid, "pc"),
+                        )
+
+
 # ----- Mode 1: browse / search / fill quantities --------------------------
 def _branch_order_browse() -> None:
     render_page_heading(f"🛒 {t('nav_order')}")
+    st.caption(t("branch_cart_sync_tip"))
     _render_active_arrival_banner()
 
     # --- Search ----------------------------------------------------------
@@ -3635,116 +6008,8 @@ def _branch_order_browse() -> None:
             f"{t('results_count')} · {t('page')} {page} {t('of')} {total_pages}"
         )
 
-        for idx, row in page_results.iterrows():
-            with st.container(border=True):
-                # Three columns: thumbnail | info | qty inputs
-                c0, c1, c2 = st.columns([1, 3, 2])
-                # ---- Thumbnail (left) ----
-                with c0:
-                    img_path = get_product_image_path(
-                        str(row.get("ItemCode", "")),
-                        str(row.get("Barcode", "")),
-                    )
-                    if img_path is not None:
-                        st.image(str(img_path), width=90)
-                    else:
-                        # Lightweight placeholder so layout is stable
-                        st.markdown(
-                            "<div style='width:90px;height:90px;"
-                            "background:#f0f0f0;border:1px dashed #bbb;"
-                            "border-radius:4px;display:flex;"
-                            "align-items:center;justify-content:center;"
-                            "color:#bbb;font-size:24px;'>📦</div>",
-                            unsafe_allow_html=True,
-                        )
-                with c1:
-                    name_disp = str(row["Name"])
-                    bro_raw = str(row.get("Barcode", "") or "").strip()
-                    bro_disp = bro_raw if bro_raw else t("branch_product_value_empty")
-                    try:
-                        price_val = float(row.get("Price", 0) or 0)
-                    except Exception:
-                        price_val = 0.0
-                    price_disp = f"{price_val:.2f}"
-                    st.markdown(
-                        "<table class='product-card-info-table' role='presentation'>"
-                        "<tbody>"
-                        "<tr>"
-                        f"<td class='product-card-info-label'>{html.escape(t('branch_product_col_name'))}</td>"
-                        f"<td class='product-card-info-value'>{html.escape(name_disp)}</td>"
-                        "</tr>"
-                        "<tr>"
-                        f"<td class='product-card-info-label'>{html.escape(t('branch_product_col_brocode'))}</td>"
-                        f"<td class='product-card-info-value'>{html.escape(bro_disp)}</td>"
-                        "</tr>"
-                        "<tr>"
-                        f"<td class='product-card-info-label'>{html.escape(t('branch_product_col_price_label'))}</td>"
-                        f"<td class='product-card-info-value'>{html.escape(price_disp)}</td>"
-                        "</tr>"
-                        "</tbody></table>",
-                        unsafe_allow_html=True,
-                    )
-                    # Show warehouse stock from products.xlsx if stock columns exist.
-                    if bool(row.get("_has_stock_info", False)):
-                        stock_ct = int(float(row.get("StockCartons", 0) or 0))
-                        stock_pc = int(float(row.get("StockPcs", 0) or 0))
-                        stock_total = int(float(row.get("StockTotal", 0) or 0))
-                        if stock_ct > 0 or stock_pc > 0:
-                            st.caption(f"🏬 库存：📦 {stock_ct} 箱 · 🔢 {stock_pc} 个")
-                        else:
-                            st.caption(f"🏬 库存：{stock_total}")
-                    # Show "already entered" badge if user filled this on
-                    # a previous page so they can see prior input survived
-                    prev_ct, prev_pc = _get_qty(
-                        _product_id(
-                            str(row.get("ItemCode", "")),
-                            str(row.get("Barcode", "")),
-                            str(row["Name"]),
-                        )
-                    )
-                    if prev_ct > 0 or prev_pc > 0:
-                        st.caption(
-                            f"✓ {t('saved_for_batch')}: "
-                            f"📦 {prev_ct} · 🔢 {prev_pc}"
-                        )
-                with c2:
-                    item_code = str(row.get("ItemCode", ""))
-                    barcode   = str(row.get("Barcode", ""))
-                    name      = str(row["Name"])
-                    pid = _product_id(item_code, barcode, name)
-                    ct_key, pc_key = _qty_widget_keys(pid)
-
-                    # Register product details so we can rebuild cart later
-                    _register_product(pid, {
-                        "item_code": item_code,
-                        "barcode":   barcode,
-                        "name":      name,
-                        "unit":      str(row.get("Unit", "")),
-                        "price":     float(row.get("Price", 0) or 0),
-                        "is_manual": 0,
-                    })
-
-                    # Restore from snapshot — if the widget is being mounted
-                    # for the first time this rerun, seed it from our dict.
-                    init_ct, init_pc = _get_qty(pid)
-                    if ct_key not in st.session_state:
-                        st.session_state[ct_key] = init_ct
-                    if pc_key not in st.session_state:
-                        st.session_state[pc_key] = init_pc
-
-                    cc1, cc2 = st.columns(2)
-                    with cc1:
-                        # NOTE: we do NOT pass `value=` because that would
-                        # fight Streamlit's session_state-driven default.
-                        st.number_input(
-                            t("cartons"), min_value=0, step=1, key=ct_key,
-                            on_change=_on_qty_change, args=(pid, "ct"),
-                        )
-                    with cc2:
-                        st.number_input(
-                            t("each_pcs"), min_value=0, step=1, key=pc_key,
-                            on_change=_on_qty_change, args=(pid, "pc"),
-                        )
+        for _, row in page_results.iterrows():
+            _render_branch_product_card(row)
 
         # --- Pagination controls -----------------------------------------
         if total_pages > 1:
@@ -3776,18 +6041,17 @@ def _branch_order_browse() -> None:
     with st.expander(t("manual_add")):
         with st.form("manual_form", clear_on_submit=True):
             mname = st.text_input(t("name"))
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: munit = st.text_input(t("unit"), value="pc")
-            with c2: mct = st.number_input(t("cartons"), min_value=0, value=0, step=1)
-            with c3: mpc = st.number_input(t("each_pcs"), min_value=0, value=0, step=1)
-            with c4: mbar = st.text_input(t("barcode"))
+            c1, c2, c3 = st.columns(3)
+            with c1: mct = st.number_input(t("cartons"), min_value=0, value=0, step=1)
+            with c2: mpc = st.number_input(t("each_pcs"), min_value=0, value=0, step=1)
+            with c3: mbar = st.text_input(t("barcode"))
             if st.form_submit_button(t("add_to_cart"), type="primary"):
                 if mname.strip() and (mct > 0 or mpc > 0):
                     st.session_state.cart.append({
                         "item_code": "",
                         "barcode":   mbar.strip(),
                         "name":      mname.strip(),
-                        "unit":      munit.strip(),
+                        "unit":      "",
                         "price":     0.0,
                         "qty_cartons": int(mct),
                         "qty_pcs":     int(mpc),
@@ -3963,6 +6227,13 @@ def _branch_order_confirm() -> None:
                             item["is_manual"], now_str(),
                         ))
 
+                audit_write(
+                    "order_submit",
+                    order_id=order_id,
+                    branch=branch,
+                    extra={"line_count": len(cart_snapshot)},
+                )
+
                 st.session_state["_last_order_submit_fp"] = fp
                 st.session_state["_last_order_submit_ts"] = unix_ts()
 
@@ -4002,9 +6273,10 @@ def _branch_order_confirm() -> None:
                     log_exception("branch_submit_new_order_email", e)
 
                 st.session_state.cart = []
+                _persist_branch_cart()
                 st.session_state["confirming"] = False
                 st.session_state["last_submitted_order_id"] = order_id
-                st.session_state.page = "order_done"
+                _set_session_page_for_app_nav("order_done")
                 _clear_qty_inputs()
                 st.rerun()
             finally:
@@ -4020,11 +6292,11 @@ def page_branch_order_done() -> None:
     c1, c2 = st.columns(2)
     with c1:
         if st.button(t("create_new_order"), use_container_width=True, type="primary"):
-            st.session_state.page = "order"
+            _set_session_page_for_app_nav("order")
             st.rerun()
     with c2:
         if st.button(t("view_my_orders_btn"), use_container_width=True):
-            st.session_state.page = "my_orders"
+            _set_session_page_for_app_nav("my_orders")
             st.rerun()
 
 
@@ -4180,6 +6452,15 @@ def _render_receive_form(order_id: str, group: pd.DataFrame) -> None:
                             "short_cartons": short_ct,
                             "short_pcs": short_pc,
                         })
+            audit_write(
+                "receive_confirm",
+                order_id=order_id,
+                branch=branch_name or st.session_state.get("branch"),
+                extra={
+                    "line_count": int(len(group)),
+                    "any_shortage": bool(any_short),
+                },
+            )
             # Send ONE shortage email summarizing all short lines for this
             # receipt — never one email per item.
             if any_short and short_items:
@@ -4927,9 +7208,581 @@ def page_warehouse_dispatch_history() -> None:
                 st.dataframe(show, use_container_width=True, hide_index=True)
 
 
+def _warehouse_supplier_email_body(
+    title_line: str,
+    lines: list[dict],
+    remarks: str,
+    ts: str,
+) -> str:
+    preview = "\n".join(
+        f"  · {str(x.get('name', '') or '')[:55]}  "
+        f"📦{int(x.get('qty_cartons', 0) or 0)}  "
+        f"🔢{int(x.get('qty_pcs', 0) or 0)}"
+        for x in lines[:30]
+    )
+    if len(lines) > 30:
+        preview += f"\n  … (+{len(lines) - 30} more / 更多行)"
+    return (
+        "SUNSHINE · Supplier purchase request / 供货商订货\n"
+        + ("=" * 52)
+        + "\n"
+        f"Time / 时间: {ts}\n"
+        f"Title / 标题: {title_line}\n"
+        f"Lines / 行数: {len(lines)}\n\n"
+        "Items / 商品（摘要）:\n"
+        + (preview or "  (none)")
+        + "\n\n"
+        "Full line list is in the attached Excel file / 完整明细见附件 Excel。\n\n"
+        "Remarks / 备注:\n"
+        + ((remarks or "").strip() or "-")
+        + "\n\n—— Warehouse staff / 仓库员工\n"
+    )
+
+
+def _wh_supplier_merge_line(cart: list[dict], line: dict) -> None:
+    key = (
+        str(line.get("item_code", "") or ""),
+        str(line.get("barcode", "") or ""),
+        str(line.get("name", "") or ""),
+    )
+    for x in cart:
+        if (
+            str(x.get("item_code", "") or ""),
+            str(x.get("barcode", "") or ""),
+            str(x.get("name", "") or ""),
+        ) == key:
+            x["qty_cartons"] = int(x.get("qty_cartons", 0) or 0) + int(
+                line.get("qty_cartons", 0) or 0
+            )
+            x["qty_pcs"] = int(x.get("qty_pcs", 0) or 0) + int(
+                line.get("qty_pcs", 0) or 0
+            )
+            return
+    cart.append(line)
+
+
+def page_warehouse_supplier_order() -> None:
+    """Warehouse: submit a restock / supplier order; notify admin + email."""
+    if "wh_supplier_cart" not in st.session_state:
+        st.session_state.wh_supplier_cart = []
+    if "wh_supplier_search_q" not in st.session_state:
+        st.session_state.wh_supplier_search_q = ""
+
+    if st.session_state.get("wh_supplier_sent"):
+        render_page_heading(t("wh_supplier_done_title"), None)
+        st.success(t("wh_supplier_done_msg"))
+        if st.button(
+            t("wh_supplier_back"),
+            type="primary",
+            use_container_width=True,
+            key="wh_supplier_back",
+        ):
+            st.session_state.wh_supplier_sent = False
+            st.rerun()
+        return
+
+    render_page_heading(
+        f"📝 {t('nav_supplier_order')}", t("wh_supplier_subtitle")
+    )
+    subj = st.text_input(
+        t("wh_supplier_subject"),
+        key="wh_s_subj",
+        placeholder=t("wh_supplier_default_subj"),
+    )
+    remarks = st.text_area(t("remarks"), key="wh_s_rem", height=90)
+
+    st.divider()
+    st.markdown(f"**{t('wh_supplier_details')}**")
+    st.caption(t("wh_supplier_search_commit_hint"))
+    with st.form("wh_supplier_search_form", clear_on_submit=False):
+        sq1, sq2 = st.columns([5, 1])
+        with sq1:
+            q_raw = st.text_input(
+                t("search_product"),
+                key="wh_sup_q",
+                placeholder=t("search_product"),
+            )
+        with sq2:
+            st.markdown(
+                "<div style='padding-top:28px;'></div>",
+                unsafe_allow_html=True,
+            )
+            do_search = st.form_submit_button(
+                t("search"), type="primary", use_container_width=True
+            )
+    if do_search:
+        st.session_state.wh_supplier_search_q = (q_raw or "").strip()
+    q = str(st.session_state.get("wh_supplier_search_q") or "").strip()
+    if len(q) < 1:
+        st.caption(t("wh_supplier_search_hint"))
+        results = pd.DataFrame()
+    else:
+        results = search_products(q, limit=200)
+
+    if not results.empty:
+        n = len(results)
+        labels: list[str] = []
+        for _, row in results.iterrows():
+            nm = str(row.get("Name", "") or "")[:45]
+            ic = str(row.get("ItemCode", "") or "")
+            bc = str(row.get("Barcode", "") or "")
+            labels.append(f"{nm}  |  {ic}  |  {bc}")
+
+        pick_idx = st.selectbox(
+            t("wh_supplier_pick"),
+            options=list(range(n)),
+            format_func=lambda i: labels[i],
+            key="wh_sup_pick_idx",
+        )
+        ac1, ac2, ac3 = st.columns([1, 1, 2])
+        with ac1:
+            add_ct = st.number_input(
+                t("cartons"), min_value=0, value=0, step=1, key="wh_sup_add_ct"
+            )
+        with ac2:
+            add_pc = st.number_input(
+                t("each_pcs"), min_value=0, value=0, step=1, key="wh_sup_add_pc"
+            )
+        with ac3:
+            st.markdown("")  # vertical spacer
+            if st.button(t("wh_supplier_add_line"), type="secondary"):
+                if add_ct <= 0 and add_pc <= 0:
+                    st.warning(t("no_qty_selected"))
+                else:
+                    row = results.iloc[int(pick_idx)]
+                    line = {
+                        "item_code": str(row.get("ItemCode", "") or ""),
+                        "barcode": str(row.get("Barcode", "") or ""),
+                        "name": str(row.get("Name", "") or ""),
+                        "unit": str(row.get("Unit", "") or ""),
+                        "qty_cartons": int(add_ct),
+                        "qty_pcs": int(add_pc),
+                    }
+                    _wh_supplier_merge_line(st.session_state.wh_supplier_cart, line)
+                    st.success(t("added_n_items").format(n=1))
+                    st.rerun()
+    elif q:
+        st.info(t("no_results"))
+
+    cart: list[dict] = st.session_state.wh_supplier_cart
+    st.divider()
+    st.markdown(
+        f"**{t('wh_supplier_cart')}** &nbsp;·&nbsp; **{len(cart)}**"
+    )
+    if cart:
+        for i, ln in enumerate(list(cart)):
+            nm = str(ln.get("name", "") or "")
+            ct_ = int(ln.get("qty_cartons", 0) or 0)
+            pc_ = int(ln.get("qty_pcs", 0) or 0)
+            bit = str(ln.get("item_code", "") or "") or str(
+                ln.get("barcode", "") or ""
+            )
+            row_cols = st.columns([5, 1])
+            with row_cols[0]:
+                st.markdown(
+                    f"{html.escape(nm)} &nbsp;·&nbsp; 📦 **{ct_}** &nbsp;·&nbsp; "
+                    f"🔢 **{pc_}**"
+                    + (f" &nbsp;`{html.escape(bit)}`" if bit else "")
+                )
+            with row_cols[1]:
+                if st.button(
+                    t("wh_supplier_remove"),
+                    key=f"wh_sup_rm_{i}",
+                    use_container_width=True,
+                ):
+                    cart.pop(i)
+                    st.rerun()
+    else:
+        st.caption("—")
+
+    st.divider()
+    if st.button(t("wh_supplier_send"), type="primary", key="wh_sup_send"):
+        if not cart:
+            st.error(t("wh_supplier_need_lines"))
+            return
+        title_line = (subj or "").strip() or t("wh_supplier_default_subj")
+        ts = now_str()
+        body = _warehouse_supplier_email_body(
+            title_line, list(cart), remarks or "", ts
+        )
+        subj_out = f"[{t('app_brand')}] {t('nav_supplier_order')}: {title_line[:100]}"
+        fname = f"{_safe_excel_filename(title_line)}.xlsx"
+        try:
+            xlsx_bytes = build_supplier_order_excel(list(cart), remarks or "", ts)
+        except Exception as e:
+            log_exception("build_supplier_order_excel", e)
+            st.error(str(e))
+            return
+        try:
+            notify(
+                "supplier_order",
+                subj_out,
+                body,
+                attachments=[
+                    (
+                        fname,
+                        xlsx_bytes,
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet",
+                    )
+                ],
+            )
+        except Exception as e:
+            log_exception("notify_supplier_order", e)
+        try:
+            summ = f"{len(cart)} lines · {title_line[:120]}"
+            create_notification(
+                "supplier_order",
+                f"{t('wh_notif_inbox_title')}: {title_line[:160]}",
+                summ[:900] + ("…" if len(summ) > 900 else ""),
+                target_role=Role.ADMIN,
+            )
+        except Exception as e:
+            log_exception("create_notification_supplier_order", e)
+        try:
+            audit_write(
+                "supplier_order",
+                extra={
+                    "title": title_line,
+                    "lines": len(cart),
+                },
+            )
+        except Exception:
+            pass
+        st.session_state.wh_supplier_cart = []
+        st.session_state.wh_supplier_search_q = ""
+        st.session_state.pop("wh_sup_q", None)
+        st.session_state.wh_supplier_sent = True
+        st.rerun()
+
+
 # =========================================================================
 # ADMIN PAGES
 # =========================================================================
+def page_admin_accounts() -> None:
+    render_page_heading(t("nav_accounts"), "")
+
+    with st.expander("➕ " + t("acct_create_user"), expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            new_u = st.text_input(t("acct_username"), key="adm_new_u")
+            new_b = st.selectbox(
+                t("select_branch"), list(BRANCHES), key="adm_new_b"
+            )
+        with c2:
+            new_p1 = st.text_input(
+                t("acct_password"), type="password", key="adm_new_p1"
+            )
+            new_p2 = st.text_input(
+                t("acct_password2"), type="password", key="adm_new_p2"
+            )
+        new_perms = st.multiselect(
+            t("acct_perms_pick"),
+            [p for p, _ in BRANCH_PERM_ORDER],
+            default=[p for p, _ in BRANCH_PERM_ORDER],
+            format_func=branch_perm_label,
+            key="adm_new_perms",
+        )
+        if st.button(t("acct_create_user"), key="adm_create_submit"):
+            if new_p1 != new_p2:
+                st.error(t("acct_pw_mismatch"))
+            else:
+                ok, ek = account_create_direct(new_u, new_p1, new_b, new_perms)
+                if ok:
+                    st.success(t("acct_updated"))
+                    st.rerun()
+                else:
+                    st.error(t(ek))
+
+    st.divider()
+    st.subheader(t("acct_pending_hdr"))
+    pending_rows = account_list_by_status(ACCOUNT_STATUS_PENDING)
+    if not pending_rows:
+        st.caption(t("no_data"))
+    for row in pending_rows:
+        rid = int(row["id"])
+        st.markdown(
+            f"**{html.escape(row['username'])}** · "
+            f"{html.escape(row['branch'])} · "
+            f"{html.escape((row['display_name'] or '').strip() or '—')}"
+        )
+        st.caption(
+            f"{t('acct_created')}: {row['created_at']}"
+        )
+        ap_sel = st.multiselect(
+            t("acct_perms_pick"),
+            [p for p, _ in BRANCH_PERM_ORDER],
+            default=[p for p, _ in BRANCH_PERM_ORDER],
+            format_func=branch_perm_label,
+            key=f"pend_perms_{rid}",
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button(t("acct_approve"), key=f"appr_{rid}"):
+                account_approve(rid, ap_sel)
+                st.success(t("acct_updated"))
+                st.rerun()
+        with c2:
+            rj_note = st.text_input(
+                t("acct_note_reject"), key=f"rj_{rid}"
+            )
+        with c3:
+            if st.button(t("acct_reject"), key=f"rjbtn_{rid}"):
+                account_set_status(rid, ACCOUNT_STATUS_REJECTED, rj_note)
+                st.success(t("acct_updated"))
+                st.rerun()
+        st.divider()
+
+    st.subheader(t("acct_approved_hdr"))
+    appr = account_list_by_status(ACCOUNT_STATUS_APPROVED)
+    if not appr:
+        st.caption(t("no_data"))
+    for row in appr:
+        rid = int(row["id"])
+        with st.expander(
+            f"{html.escape(row['username'])} — {html.escape(row['branch'])}"
+        ):
+            cur = _parse_permissions_json(row["permissions"])
+            ed = st.multiselect(
+                t("acct_perms_pick"),
+                [p for p, _ in BRANCH_PERM_ORDER],
+                default=cur or [p for p, _ in BRANCH_PERM_ORDER],
+                format_func=branch_perm_label,
+                key=f"ed_perms_{rid}",
+            )
+            if st.button(t("acct_save_perms"), key=f"savep_{rid}"):
+                if not ed:
+                    st.error(t("acct_perm_need_admin"))
+                else:
+                    account_update_permissions(rid, ed)
+                    st.success(t("acct_updated"))
+                    st.rerun()
+            st.divider()
+            npw1 = st.text_input(
+                t("acct_reset_pw"), type="password", key=f"npw1_{rid}"
+            )
+            npw2 = st.text_input(
+                t("acct_password2"), type="password", key=f"npw2_{rid}"
+            )
+            if st.button(t("acct_pw_apply"), key=f"setpw_{rid}"):
+                if len(npw1) < 6:
+                    st.error(t("acct_pw_short"))
+                elif npw1 != npw2:
+                    st.error(t("acct_pw_mismatch"))
+                else:
+                    account_set_password(rid, npw1)
+                    st.success(t("acct_updated"))
+                    st.rerun()
+
+
+def page_admin_audit_log() -> None:
+    render_page_heading(t("nav_audit_log"), t("audit_log_subtitle"))
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        d0 = st.date_input(
+            t("audit_filter_from"),
+            value=datetime.now().date() - timedelta(days=7),
+            key="adm_audit_d0",
+        )
+    with c2:
+        d1 = st.date_input(
+            t("audit_filter_to"),
+            value=datetime.now().date(),
+            key="adm_audit_d1",
+        )
+    with c3:
+        br_sel = st.selectbox(
+            t("audit_filter_branch"),
+            [t("audit_all_branches")] + list(BRANCHES),
+            key="adm_audit_br",
+        )
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        ev_pick = st.multiselect(
+            t("audit_filter_events"),
+            list(AUDIT_EVENT_TYPES),
+            default=list(AUDIT_EVENT_TYPES),
+            format_func=_audit_event_label,
+            key="adm_audit_ev",
+        )
+    with c5:
+        ord_q = (st.text_input(t("audit_filter_order"), key="adm_audit_oid") or "").strip()
+    with c6:
+        usr_q = (st.text_input(t("audit_filter_user"), key="adm_audit_usr") or "").strip()
+
+    s0, s1 = d0.isoformat(), d1.isoformat()
+    clauses: list[str] = [
+        "date(created_at) >= date(?)",
+        "date(created_at) <= date(?)",
+    ]
+    par: list[object] = [s0, s1]
+    if ev_pick:
+        clauses.append(
+            "event_type IN (%s)" % ",".join("?" * len(ev_pick))
+        )
+        par.extend(ev_pick)
+    if br_sel and br_sel != t("audit_all_branches"):
+        clauses.append("branch = ?")
+        par.append(br_sel)
+    if ord_q:
+        clauses.append("order_id LIKE ?")
+        par.append(f"%{ord_q}%")
+    if usr_q:
+        clauses.append("COALESCE(username,'') LIKE ?")
+        par.append(f"%{usr_q}%")
+    sql = (
+        "SELECT * FROM audit_log WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY created_at DESC LIMIT 2000"
+    )
+    with db_conn() as conn:
+        rows = conn.execute(sql, par).fetchall()
+    if not rows:
+        st.info(t("audit_no_rows"))
+        return
+    out = []
+    for r in rows:
+        ev = r["event_type"]
+        out.append(
+            {
+                t("audit_col_time"): r["created_at"],
+                t("audit_col_event"): _audit_event_label(ev),
+                t("audit_col_role"): r["role"] or "",
+                t("audit_col_account"): (
+                    str(int(r["account_id"]))
+                    if r["account_id"] is not None
+                    else ""
+                ),
+                t("audit_col_user"): r["username"] or "",
+                t("audit_col_branch"): r["branch"] or "",
+                t("audit_col_order"): r["order_id"] or "",
+                t("audit_col_detail"): _format_audit_detail_display(
+                    r["detail"], str(ev)
+                ),
+            }
+        )
+    display_df = pd.DataFrame(out)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    csv_bytes = display_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label=t("audit_export_csv"),
+        data=csv_bytes,
+        file_name=f"audit_log_{s0}_{s1}.csv",
+        mime="text/csv",
+        key="adm_audit_dl",
+    )
+
+
+def page_admin_shelf_mobile() -> None:
+    """Mobile-friendly catalog builder: wipe all, then enter shelf lines."""
+    render_page_heading(t("nav_shelf_mobile"), t("shelf_mobile_subtitle"))
+
+    rev = int(st.session_state.get("shelf_rev", 0))
+    boot_key = f"_shelf_boot_df_{rev}"
+    if boot_key not in st.session_state:
+        st.session_state[boot_key] = _shelf_bootstrap_dataframe()
+
+    with st.expander(t("shelf_wipe_title"), expanded=False):
+        st.markdown(t("shelf_wipe_blurb"))
+        wipe_ack = (st.text_input(
+            t("shelf_wipe_confirm"),
+            key=f"shelf_wipe_ack_{rev}",
+            placeholder="CLEAR / 清空",
+        ) or "").strip()
+        wipe_ok = wipe_ack.upper() == "CLEAR" or wipe_ack == "清空"
+        if st.button(
+            "⚠️ " + t("shelf_wipe_title"),
+            type="primary",
+            disabled=not wipe_ok,
+            key=f"shelf_wipe_go_{rev}",
+            use_container_width=True,
+        ):
+            admin_wipe_all_products_and_stock()
+            st.session_state.shelf_rev = rev + 1
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("_shelf_boot_df_"):
+                    del st.session_state[k]
+            audit_write(
+                "catalog_reset",
+                detail="admin wiped products.xlsx + inventory + prices",
+            )
+            st.success(t("shelf_wipe_ok"))
+            st.rerun()
+
+    st.caption(t("shelf_editor_hint"))
+    init_df = st.session_state[boot_key]
+    show_cols = [c for c in _product_master_excel_columns() if c != "StockTotal"]
+    for c in show_cols:
+        if c not in init_df.columns:
+            init_df[c] = 0.0 if c in (
+                "Price", "PcsPerCarton", "StockCartons", "StockPcs", "StockTotal",
+            ) else ""
+    init_df = init_df[show_cols]
+    edited = st.data_editor(
+        init_df,
+        key=f"shelf_grid_{rev}",
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "ItemCode": st.column_config.TextColumn(t("item_code"), width="small"),
+            "Barcode": st.column_config.TextColumn(t("barcode"), width="medium"),
+            "Name": st.column_config.TextColumn(t("name"), width="large"),
+            "Unit": st.column_config.TextColumn(t("unit"), width="small"),
+            "Category": st.column_config.TextColumn("Category", width="small"),
+            "Price": st.column_config.NumberColumn(
+                t("price"),
+                format="%.2f",
+                min_value=0.0,
+                step=0.01,
+            ),
+            "PcsPerCarton": st.column_config.NumberColumn(
+                t("shelf_pcs_per_carton"),
+                min_value=0,
+                step=1,
+                format="%d",
+            ),
+            "StockCartons": st.column_config.NumberColumn(
+                t("grid_inv_stock_ct"),
+                min_value=0,
+                step=1,
+                format="%d",
+            ),
+            "StockPcs": st.column_config.NumberColumn(
+                t("grid_inv_stock_pc"),
+                min_value=0,
+                step=1,
+                format="%d",
+            ),
+        },
+        hide_index=True,
+    )
+
+    if st.button(
+        t("shelf_save_btn"),
+        type="primary",
+        key=f"shelf_save_{rev}",
+        use_container_width=True,
+    ):
+        n_prod, inv_lines = admin_save_shelf_catalog(edited)
+        if n_prod <= 0:
+            st.warning(t("shelf_need_name"))
+        else:
+            st.session_state.shelf_rev = rev + 1
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("_shelf_boot_df_"):
+                    del st.session_state[k]
+            audit_write(
+                "catalog_save",
+                detail=json.dumps(
+                    {"products_saved": n_prod, "inventory_writes": inv_lines},
+                    ensure_ascii=False,
+                ),
+            )
+            st.success(t("shelf_save_ok"))
+            st.rerun()
+
+
 def page_admin_dashboard() -> None:
     render_page_heading(f"📊 {t('nav_dashboard')}")
     today = today_str()
@@ -5092,7 +7945,7 @@ def _attach_categories(df: pd.DataFrame) -> pd.DataFrame:
     Barcode (exact). Unmatched (e.g. manually added items) → 'General'."""
     if df.empty:
         return df.assign(Category="General")
-    products = load_products(_products_mtime(), _inventory_version())
+    products = load_products(_products_mtime(), _inventory_version(), _price_version())
     if products.empty:
         return df.assign(Category="General")
 
@@ -5437,6 +8290,36 @@ def export_shortage_report(date_from: str, date_to: str):
     return bio
 
 
+def export_inventory_report(date_from: str = "", date_to: str = ""):
+    """Export current inventory snapshot (all SKUs)."""
+    with db_conn() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT item_code, barcode, name, unit, stock_cartons, stock_pcs, updated_at
+            FROM inventory
+            ORDER BY name ASC
+            """,
+            conn,
+        )
+    if df.empty:
+        return None
+    wb = Workbook(); ws = wb.active; ws.title = "Inventory"
+    headers = [
+        t("item_code"), t("barcode"), t("name"), t("unit"),
+        t("qty_cartons"), t("qty_pcs"), t("order_date"),
+    ]
+    ws.append(headers)
+    for _, r in df.iterrows():
+        ws.append([
+            r["item_code"], r["barcode"], r["name"], r["unit"],
+            int(r["stock_cartons"] or 0), int(r["stock_pcs"] or 0), r["updated_at"],
+        ])
+    _style_excel_header(ws, len(headers))
+    _autosize(ws)
+    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
+    return bio
+
+
 def page_admin_images() -> None:
     """Upload / view / remove product images. Manager-only."""
     render_page_heading(f"🖼️ {t('img_title')}")
@@ -5518,7 +8401,7 @@ def page_admin_images() -> None:
 
         if batch_uploads:
             # Build a pairing preview from the current products master.
-            products_df = load_products(_products_mtime(), _inventory_version())
+            products_df = load_products(_products_mtime(), _inventory_version(), _price_version())
             matched, unmatched = plan_batch_image_upload(
                 batch_uploads, products_df,
             )
@@ -5947,6 +8830,7 @@ def page_admin_email() -> None:
         ("new_order",  "ev_new_order"),
         ("dispatched", "ev_dispatched"),
         ("shortage",   "ev_shortage"),
+        ("supplier_order", "ev_supplier_order"),
     ]:
         cur = ev_cfg.get(key, {"enabled": True, "to": []})
         with st.container(border=True):
@@ -6068,74 +8952,455 @@ def page_admin_email() -> None:
                 st.error(str(e))
 
 
-def page_admin_inventory() -> None:
-    render_page_heading(f"📦 {t('inv_title')}")
+def _persist_excel_import_feedback(
+    storage_key: str, outcome: ExcelSheetImportOutcome
+) -> None:
+    st.session_state[storage_key] = {
+        "written": outcome.n_written,
+        "skipped": outcome.n_skipped_benign,
+        "failed": outcome.n_failed,
+        "errors": list(outcome.failure_messages[:120]),
+    }
+
+
+def _render_excel_import_feedback_panel(storage_key: str) -> None:
+    blob = st.session_state.get(storage_key)
+    if not blob:
+        return
+    n_written = int(blob.get("written") or 0)
+    n_fail = int(blob.get("failed") or 0)
+    skipped = int(blob.get("skipped") or 0)
+    if n_fail > 0:
+        st.warning(t("import_finished_with_errors"))
+    elif n_written > 0:
+        st.success(t("import_finished_toast").format(n=n_written))
+    elif skipped > 0:
+        st.info(t("import_finished_nothing_changed"))
+    else:
+        st.info(t("import_finished_no_effect_rows"))
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        st.metric(t("import_metric_written"), n_written)
+    with mc2:
+        st.metric(t("import_metric_skipped"), skipped)
+    with mc3:
+        st.metric(t("import_metric_failed"), n_fail)
+    if skipped > 0 and n_fail == 0:
+        st.caption(t("import_summary_skipped_hint"))
+    errs = list(blob.get("errors") or [])
+    if errs:
+        with st.expander(
+            t("import_error_detail"),
+            expanded=(len(errs) <= 12),
+        ):
+            for line in errs:
+                st.markdown(
+                    html.escape(str(line)),
+                    unsafe_allow_html=True,
+                )
+
+
+def page_admin_price_management() -> None:
+    render_section_title(f"💰 {t('nav_price')}")
+    price_import_feedback_key = "_price_import_feedback"
+    with st.expander(t("excel_batch_import"), expanded=False):
+        c1, c2 = st.columns([2, 4])
+        with c1:
+            st.download_button(
+                label=t("download_price_template"),
+                data=_build_price_import_template_bytes(),
+                file_name="价格导入模板.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="price_download_template",
+            )
+            price_file = st.file_uploader(
+                t("select_import_file"),
+                type=["xlsx", "xls"],
+                key="price_import_file",
+                help="Excel: ItemCode / Barcode / Name / Price",
+            )
+            if st.button(
+                t("price_import_from_products"),
+                type="primary",
+                use_container_width=True,
+                key="price_import_btn",
+            ):
+                if price_file is None:
+                    st.warning(t("import_file_required"))
+                else:
+                    up_df = _load_products_sheet_from_upload(price_file)
+                    if up_df.empty:
+                        st.warning(t("import_file_invalid"))
+                    else:
+                        nm = up_df["Name"].astype(str).str.strip()
+                        with_name = up_df[nm != ""]
+                        if not with_name.empty:
+                            pv = pd.to_numeric(
+                                with_name["Price"], errors="coerce"
+                            ).fillna(0)
+                            if (pv == 0).all():
+                                st.warning(t("price_import_no_numeric_prices"))
+                        outcome = import_prices_from_products_detailed(df=up_df)
+                        _persist_excel_import_feedback(
+                            price_import_feedback_key,
+                            outcome,
+                        )
+                        st.session_state.pop("price_import_file", None)
+                        st.rerun()
+        with c2:
+            _render_excel_import_feedback_panel(price_import_feedback_key)
+            st.caption(t("price_hint"))
+
+    if "price_applied_q" not in st.session_state:
+        st.session_state["price_applied_q"] = ""
+
+    with st.form("price_search_form"):
+        st.text_input(
+            t("grid_keyword_search"),
+            key="price_kw_form_field",
+            placeholder="2151",
+        )
+        submitted = st.form_submit_button(
+            t("grid_search_apply"),
+            use_container_width=True,
+        )
+    if submitted:
+        st.session_state["price_applied_q"] = (
+            st.session_state.get("price_kw_form_field", "") or ""
+        ).strip()
+
+    active_q = st.session_state["price_applied_q"].strip()
+    if not active_q:
+        st.info(t("grid_price_enter_keyword"))
+        st.caption(t("grid_price_click_edit_hint"))
+        return
+
+    products = search_products(active_q, limit=500)
+    if products.empty:
+        st.warning(t("no_data"))
+        st.caption(t("grid_price_click_edit_hint"))
+        return
+
+    sheet_map = _sheet_price_lookup()
+    rows: list[dict] = []
+    base_prices: dict[str, float] = {}
+    for _, row in products.iterrows():
+        nm = str(row.get("Name", "") or "").strip()
+        if not nm:
+            continue
+        ic = str(row.get("ItemCode", "") or "").strip()
+        bc = str(row.get("Barcode", "") or "").strip()
+        k = _inventory_item_key(ic, bc, nm)
+        eff = float(row.get("Price", 0) or 0)
+        lst = float(sheet_map.get(k, eff))
+        base_prices[k] = eff
+        rows.append({
+            "ItemCode": ic,
+            "Barcode": bc,
+            "Name": nm,
+            "Unit": str(row.get("Unit", "") or "").strip(),
+            "ListPrice": round(lst, 2),
+            "Price": round(eff, 2),
+        })
+    if not rows:
+        st.info(t("no_data"))
+        return
+
+    edit_df = pd.DataFrame(rows)
+    st.caption(t("grid_price_click_edit_hint"))
+    edited = st.data_editor(
+        edit_df,
+        key="price_management_grid",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["ItemCode", "Barcode", "Name", "Unit", "ListPrice"],
+        column_config={
+            "ItemCode": st.column_config.TextColumn(t("item_code"), width="small"),
+            "Barcode": st.column_config.TextColumn(t("barcode"), width="medium"),
+            "Name": st.column_config.TextColumn(t("name"), width="large"),
+            "Unit": st.column_config.TextColumn(t("unit"), width="small"),
+            "ListPrice": st.column_config.NumberColumn(
+                t("price_sheet_col"),
+                format="%.2f",
+            ),
+            "Price": st.column_config.NumberColumn(
+                t("price_current_col"),
+                format="%.2f",
+                min_value=0.0,
+                step=0.01,
+            ),
+        },
+    )
+    if st.button(t("grid_price_save"), type="primary", key="price_save_grid"):
+        n = 0
+        with db_conn() as conn:
+            for _, row in edited.iterrows():
+                ic = str(row.get("ItemCode", "") or "").strip()
+                bc = str(row.get("Barcode", "") or "").strip()
+                nm = str(row.get("Name", "") or "").strip()
+                if not nm:
+                    continue
+                k = _inventory_item_key(ic, bc, nm)
+                new_p = float(row.get("Price", 0) or 0)
+                old_p = float(base_prices.get(k, new_p))
+                if abs(new_p - old_p) < 1e-9:
+                    continue
+                _upsert_product_price(
+                    conn,
+                    item_code=ic,
+                    barcode=bc,
+                    name=nm,
+                    price=new_p,
+                    operator="admin_price_edit",
+                )
+                n += 1
+        if n == 0:
+            st.warning(t("grid_price_no_changes"))
+        else:
+            load_products.clear()
+            st.success(t("price_import_done").format(n=n))
+            st.rerun()
+
+    with st.expander(t("price_full_list_expander"), expanded=False):
+        full = load_products(_products_mtime(), _inventory_version(), _price_version())
+        if full.empty:
+            st.info(t("no_data"))
+        else:
+            with db_conn() as conn:
+                price_rows = conn.execute(
+                    "SELECT item_key, updated_at FROM product_prices"
+                ).fetchall()
+            updated_by_key = {
+                str(r["item_key"]): str(r["updated_at"] or "")
+                for r in price_rows
+            }
+            summary_rows = []
+            for _, row in full.iterrows():
+                name = str(row.get("Name", "") or "").strip()
+                if not name:
+                    continue
+                ic = str(row.get("ItemCode", "") or "").strip()
+                bc = str(row.get("Barcode", "") or "").strip()
+                key = _inventory_item_key(ic, bc, name)
+                summary_rows.append({
+                    t("item_code"): ic,
+                    t("barcode"): bc,
+                    t("name"): name,
+                    t("price"): float(row.get("Price", 0) or 0),
+                    t("updated_at"): updated_by_key.get(key, ""),
+                })
+            st.dataframe(
+                pd.DataFrame(summary_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+def _render_inventory_workspace(
+    *,
+    operator_key: str,
+    key_prefix: str = "",
+) -> None:
+    """Import / adjust / current snapshot — shared by admin hub and warehouse."""
+    pf = key_prefix
+    inv_feedback_key = f"{pf}_inv_excel_import_feedback"
     c1, c2 = st.columns([2, 4])
     with c1:
-        if st.button(t("inv_import_append"), type="primary", use_container_width=True):
-            n = import_inventory_from_products(overwrite=False)
-            st.success(t("inv_import_done").format(n=n))
-            st.rerun()
+        st.download_button(
+            label=t("download_inv_template"),
+            data=_build_inventory_import_template_bytes(),
+            file_name="库存导入模板.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"{pf}inv_download_template",
+        )
+        inv_file = st.file_uploader(
+            t("select_import_file"),
+            type=["xlsx", "xls"],
+            key=f"{pf}inv_import_file",
+            help="Excel: ItemCode / Barcode / Name / StockCartons / StockPcs / StockTotal",
+        )
+        if st.button(
+            t("inv_import_append"),
+            type="primary",
+            use_container_width=True,
+            key=f"{pf}inv_import_append_btn",
+        ):
+            if inv_file is None:
+                st.warning(t("import_file_required"))
+            else:
+                up_df = _load_products_sheet_from_upload(inv_file)
+                if up_df.empty:
+                    st.warning(t("import_file_invalid"))
+                else:
+                    outcome = import_inventory_from_products_detailed(
+                        overwrite=False, df=up_df
+                    )
+                    _persist_excel_import_feedback(inv_feedback_key, outcome)
+                    st.session_state.pop(f"{pf}inv_import_file", None)
+                    st.rerun()
         with st.expander(t("inv_import_overwrite_section")):
             st.caption(t("inv_import_overwrite_hint"))
-            if st.button(t("inv_import_overwrite"), type="secondary", use_container_width=True, key="inv_import_ow_btn"):
-                n = import_inventory_from_products(overwrite=True)
-                st.success(t("inv_import_done").format(n=n))
-                st.rerun()
+            if st.button(
+                t("inv_import_overwrite"),
+                type="secondary",
+                use_container_width=True,
+                key=f"{pf}inv_import_ow_btn",
+            ):
+                if inv_file is None:
+                    st.warning(t("import_file_required"))
+                else:
+                    up_df = _load_products_sheet_from_upload(inv_file)
+                    if up_df.empty:
+                        st.warning(t("import_file_invalid"))
+                    else:
+                        outcome = import_inventory_from_products_detailed(
+                            overwrite=True, df=up_df
+                        )
+                        _persist_excel_import_feedback(inv_feedback_key, outcome)
+                        st.session_state.pop(f"{pf}inv_import_file", None)
+                        st.rerun()
     with c2:
+        _render_excel_import_feedback_panel(inv_feedback_key)
         st.caption(t("inv_import_append_hint"))
         st.caption("库存以数据库为准；发货时会自动扣减。")
 
     st.divider()
     render_section_title(t("inv_adjust"))
-    products = search_products("", limit=300)
-    options = []
-    for _, r in products.iterrows():
-        nm = str(r.get("Name", "") or "").strip()
-        if not nm:
-            continue
-        ic = str(r.get("ItemCode", "") or "").strip()
-        bc = str(r.get("Barcode", "") or "").strip()
-        label = f"{nm} [{ic or '-'}] ({bc or '-'})"
-        options.append(label)
-    if not options:
-        st.info(t("no_data"))
-        return
-    pick = st.selectbox("选择商品", options=options, index=0, key="inv_pick")
-    d1, d2 = st.columns(2)
-    with d1:
-        change_ct = st.number_input(t("inv_change_ct"), step=1, value=0, key="inv_change_ct")
-    with d2:
-        change_pc = st.number_input(t("inv_change_pc"), step=1, value=0, key="inv_change_pc")
-    if st.button(t("inv_apply"), key="inv_apply_btn"):
-        if not pick:
+    sq = f"{pf}inv_applied_q"
+    fk = f"{pf}inv_kw_form_field"
+    if sq not in st.session_state:
+        st.session_state[sq] = ""
+
+    with st.form(f"{pf}inv_search_form"):
+        st.text_input(
+            t("grid_keyword_search"),
+            key=fk,
+            placeholder="2151",
+        )
+        inv_sub = st.form_submit_button(
+            t("grid_search_apply"),
+            use_container_width=True,
+        )
+    if inv_sub:
+        st.session_state[sq] = (st.session_state.get(fk, "") or "").strip()
+
+    active_inv_q = st.session_state[sq].strip()
+    if not active_inv_q:
+        st.info(t("grid_price_enter_keyword"))
+    else:
+        inv_products = search_products(active_inv_q, limit=500)
+        if inv_products.empty:
             st.warning(t("no_data"))
-        elif int(change_ct) == 0 and int(change_pc) == 0:
-            st.warning("变动不能为 0")
         else:
-            nm = pick.split(" [", 1)[0].strip()
-            ic = ""
-            bc = ""
-            try:
-                tail = pick.split("[", 1)[1]
-                ic = tail.split("]", 1)[0].strip()
-                bc = pick.rsplit("(", 1)[1].rstrip(")").strip()
-            except Exception:
-                pass
-            with db_conn() as conn:
-                _apply_inventory_change(
-                    conn,
-                    txn_type="ADJUST",
-                    item_code=ic if ic != "-" else "",
-                    barcode=bc if bc != "-" else "",
-                    name=nm,
-                    unit="",
-                    change_ct=int(change_ct),
-                    change_pc=int(change_pc),
-                    operator="admin_adjust",
+            st.caption(t("grid_inv_delta_hint"))
+            inv_rows: list[dict] = []
+            for _, r in inv_products.iterrows():
+                nm = str(r.get("Name", "") or "").strip()
+                if not nm:
+                    continue
+                ic = str(r.get("ItemCode", "") or "").strip()
+                bc = str(r.get("Barcode", "") or "").strip()
+                inv_rows.append({
+                    "ItemCode": ic,
+                    "Barcode": bc,
+                    "Name": nm,
+                    "Unit": str(r.get("Unit", "") or "").strip(),
+                    "StockCartons": int(
+                        float(r.get("StockCartons", 0) or 0)
+                    ),
+                    "StockPcs": int(float(r.get("StockPcs", 0) or 0)),
+                    "DeltaCt": 0,
+                    "DeltaPc": 0,
+                })
+            if not inv_rows:
+                st.info(t("no_data"))
+            else:
+                inv_edit = pd.DataFrame(inv_rows)
+                inv_edited = st.data_editor(
+                    inv_edit,
+                    key=f"{pf}inv_grid",
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    disabled=[
+                        "ItemCode",
+                        "Barcode",
+                        "Name",
+                        "Unit",
+                        "StockCartons",
+                        "StockPcs",
+                    ],
+                    column_config={
+                        "ItemCode": st.column_config.TextColumn(
+                            t("item_code"), width="small"
+                        ),
+                        "Barcode": st.column_config.TextColumn(
+                            t("barcode"), width="medium"
+                        ),
+                        "Name": st.column_config.TextColumn(
+                            t("name"), width="large"
+                        ),
+                        "Unit": st.column_config.TextColumn(
+                            t("unit"), width="small"
+                        ),
+                        "StockCartons": st.column_config.NumberColumn(
+                            t("grid_inv_stock_ct"),
+                            format="%d",
+                        ),
+                        "StockPcs": st.column_config.NumberColumn(
+                            t("grid_inv_stock_pc"),
+                            format="%d",
+                        ),
+                        "DeltaCt": st.column_config.NumberColumn(
+                            t("grid_inv_delta_ct"),
+                            format="%d",
+                            step=1,
+                        ),
+                        "DeltaPc": st.column_config.NumberColumn(
+                            t("grid_inv_delta_pc"),
+                            format="%d",
+                            step=1,
+                        ),
+                    },
                 )
-            st.success("库存已调整")
-            st.rerun()
+                if st.button(
+                    t("grid_inv_apply_rows"),
+                    type="primary",
+                    key=f"{pf}inv_apply_grid_btn",
+                ):
+                    n = 0
+                    with db_conn() as conn:
+                        for _, row in inv_edited.iterrows():
+                            dct = int(float(row.get("DeltaCt", 0) or 0))
+                            dpc = int(float(row.get("DeltaPc", 0) or 0))
+                            if dct == 0 and dpc == 0:
+                                continue
+                            nm = str(row.get("Name", "") or "").strip()
+                            if not nm:
+                                continue
+                            ic = str(row.get("ItemCode", "") or "").strip()
+                            bc = str(row.get("Barcode", "") or "").strip()
+                            ut = str(row.get("Unit", "") or "").strip()
+                            _apply_inventory_change(
+                                conn,
+                                txn_type="ADJUST",
+                                item_code=ic if ic != "-" else "",
+                                barcode=bc if bc != "-" else "",
+                                name=nm,
+                                unit=ut,
+                                change_ct=dct,
+                                change_pc=dpc,
+                                operator=operator_key,
+                            )
+                            n += 1
+                    if n == 0:
+                        st.warning(t("grid_inv_no_delta"))
+                    else:
+                        st.success(t("inv_adjust_ok"))
+                        st.rerun()
 
     st.divider()
     render_section_title(t("inv_current"))
@@ -6149,10 +9414,57 @@ def page_admin_inventory() -> None:
         st.info(t("no_data"))
     else:
         inv_df.columns = [
-            t("item_code"), t("barcode"), t("name"),
-            t("qty_cartons"), t("qty_pcs"), t("order_date"),
+            t("item_code"),
+            t("barcode"),
+            t("name"),
+            t("qty_cartons"),
+            t("qty_pcs"),
+            t("order_date"),
         ]
         st.dataframe(inv_df, use_container_width=True, hide_index=True)
+
+
+def page_warehouse_inventory() -> None:
+    """Warehouse: same inventory tools as admin (import / adjust / view current)."""
+    render_page_heading(f"📦 {t('nav_inventory')}")
+    _render_inventory_workspace(
+        operator_key="warehouse_adjust",
+        key_prefix="wh_inv_",
+    )
+
+
+def page_admin_inventory() -> None:
+    render_page_heading(f"📦 {t('inv_title')}")
+    module_options = [
+        t("inv_title"),
+        t("nav_price"),
+        t("nav_dispatch"),
+        t("nav_all_orders"),
+        t("nav_images"),
+    ]
+    module = st.radio(
+        t("choose_module"),
+        options=module_options,
+        horizontal=True,
+        key="admin_inventory_module",
+    )
+    if module == t("nav_price"):
+        page_admin_price_management()
+        return
+    if module == t("nav_dispatch"):
+        page_warehouse_pending()
+        return
+    if module == t("nav_all_orders"):
+        page_admin_all_orders()
+        return
+    if module == t("nav_images"):
+        page_admin_images()
+        return
+
+    _render_inventory_workspace(
+        operator_key="admin_adjust",
+        key_prefix="",
+    )
 
 
 def page_admin_export() -> None:
@@ -6167,6 +9479,7 @@ def page_admin_export() -> None:
         ("exp_picking", export_picking_list,    "picking_list"),
         ("exp_recon",   export_reconciliation,  "reconciliation"),
         ("exp_short",   export_shortage_report, "shortage_report"),
+        ("exp_inventory", export_inventory_report, "inventory_report"),
     ]:
         st.divider()
         render_section_title(t(label_key))
@@ -6183,6 +9496,32 @@ def page_admin_export() -> None:
                 )
 
 
+def page_admin_messages_center() -> None:
+    render_page_heading(f"📨 {t('nav_messages')} · {t('admin_messages_hub')}")
+    module_options = [
+        t("nav_messages"),
+        t("nav_short_mgmt"),
+        t("nav_arrivals"),
+        t("nav_email"),
+    ]
+    module = st.radio(
+        t("choose_module"),
+        options=module_options,
+        horizontal=True,
+        key="admin_messages_module",
+    )
+    if module == t("nav_short_mgmt"):
+        page_warehouse_shortages()
+        return
+    if module == t("nav_arrivals"):
+        page_admin_arrivals()
+        return
+    if module == t("nav_email"):
+        page_admin_email()
+        return
+    page_messages()
+
+
 # =========================================================================
 # WORKSPACE ROUTERS
 # =========================================================================
@@ -6196,6 +9535,11 @@ def _render_sidebar_nav(items: list[tuple[str, str]]) -> None:
             type="primary" if is_active else "secondary",
         ):
             st.session_state.page = page_key
+            st.session_state._nav_from_sidebar = True
+            try:
+                st.query_params[URL_PAGE_QUERY_KEY] = page_key
+            except Exception:
+                pass
             # Leaving any page should drop the order-confirm modal state.
             st.session_state["confirming"] = False
             st.rerun()
@@ -6216,7 +9560,11 @@ def _page_theme_color(page_key: str) -> str:
         "pending": "#00838f",
         "short_in": "#c62828",
         "history": "#455a64",
+        "supplier": "#00695c",
         "dashboard": "#3949ab",
+        "shelf_mobile": "#00695c",
+        "accounts": "#5e35b1",
+        "audit": "#37474f",
         "all_orders": "#5d4037",
         "dispatch": "#0277bd",
         "short_mgmt": "#d84315",
@@ -6240,18 +9588,15 @@ def _render_active_page_hint(items: list[tuple[str, str]]) -> None:
         return
     color = _page_theme_color(page_key)
     st.markdown(
-        (
-            f"<div style='margin:6px 0 10px 0; padding:8px 12px; border-left:4px solid {color};"
-            "background:#f8fbff; border-radius:8px; color:#1f2937; font-weight:600;'>"
-            f"当前页面：{html.escape(label)}</div>"
-        ),
+        f'<div class="active-page-hint" style="--hint-accent:{color};">'
+        f'<span class="active-page-hint__k">当前页面</span>'
+        f'<span class="active-page-hint__v">{html.escape(label)}</span></div>',
         unsafe_allow_html=True,
     )
 
 
 def render_branch() -> None:
-    render_header(f"🛒 {st.session_state.branch}")
-    render_lang_switch()
+    render_sidebar_lang_switch()
 
     st.sidebar.markdown(
         (
@@ -6264,13 +9609,34 @@ def render_branch() -> None:
     )
     st.sidebar.divider()
 
-    nav_items = [
-        ("order",     t("nav_order")),
-        ("my_orders", t("nav_my_orders")),
-        ("my_short",  t("nav_my_short")),
-        ("messages",  _nav_messages_label()),
-        ("ai",        t("nav_ai")),
+    full_nav = [
+        ("order", t("nav_order"), "order"),
+        ("my_orders", t("nav_my_orders"), "my_orders"),
+        ("my_short", t("nav_my_short"), "my_short"),
+        ("messages", _nav_messages_label(), "messages"),
+        ("ai", t("nav_ai"), "ai"),
     ]
+    nav_items = [(a, b) for a, b, p in full_nav if has_branch_perm(p)]
+    if not nav_items:
+        st.error(t("acct_perm_need_admin"))
+        logout_button("logout_branch_noperm")
+        return
+
+    allowed = _branch_nav_allowed_keys(nav_items)
+    nav_from_sidebar = st.session_state.pop("_nav_from_sidebar", False)
+    if not nav_from_sidebar:
+        _apply_url_page_to_session(Role.BRANCH, allowed)
+
+    ensure_branch_page_allowed(st.session_state.get("page") or nav_items[0][0])
+
+    _sync_browser_history_stack(
+        allowed=allowed,
+        current_page=st.session_state.page,
+        nav_from_sidebar=nav_from_sidebar,
+    )
+
+    _hydrate_branch_cart_if_needed()
+
     _render_sidebar_nav(nav_items)
     st.sidebar.divider()
     with st.sidebar:
@@ -6286,11 +9652,11 @@ def render_branch() -> None:
         "ai":        page_ai_assistant,
     }
     pages.get(st.session_state.page, page_branch_order)()
+    _persist_branch_cart()
 
 
 def render_warehouse() -> None:
-    render_header(t("role_warehouse"))
-    render_lang_switch()
+    render_sidebar_lang_switch()
 
     st.sidebar.markdown(f"**{t('role_warehouse')}**")
     st.sidebar.divider()
@@ -6298,9 +9664,21 @@ def render_warehouse() -> None:
         ("pending",  t("nav_pending")),
         ("short_in", t("nav_short_in")),
         ("history",  t("nav_dispatch_history")),
+        ("supplier", t("nav_supplier_order")),
+        ("inventory", t("nav_inventory")),
         ("messages", _nav_messages_label()),
         ("ai",       t("nav_ai")),
     ]
+    nav_from_sidebar = st.session_state.pop("_nav_from_sidebar", False)
+    if not nav_from_sidebar:
+        _apply_url_page_to_session(Role.WAREHOUSE, WAREHOUSE_PAGE_KEYS)
+    if (st.session_state.get("page") or "") not in WAREHOUSE_PAGE_KEYS:
+        st.session_state.page = "pending"
+    _sync_browser_history_stack(
+        allowed=WAREHOUSE_PAGE_KEYS,
+        current_page=st.session_state.page,
+        nav_from_sidebar=nav_from_sidebar,
+    )
     _render_sidebar_nav(nav_items)
     st.sidebar.divider()
     with st.sidebar:
@@ -6311,6 +9689,8 @@ def render_warehouse() -> None:
         "pending":  page_warehouse_pending,
         "short_in": page_warehouse_shortages,
         "history":  page_warehouse_dispatch_history,
+        "supplier": page_warehouse_supplier_order,
+        "inventory": page_warehouse_inventory,
         "messages": page_messages,
         "ai":       page_ai_assistant,
     }
@@ -6318,25 +9698,31 @@ def render_warehouse() -> None:
 
 
 def render_admin() -> None:
-    render_header(t("role_admin"))
-    render_lang_switch()
+    render_sidebar_lang_switch()
 
     st.sidebar.markdown(f"**{t('role_admin')}**")
     st.sidebar.divider()
     nav_items = [
         ("dashboard",  t("nav_dashboard")),
-        ("all_orders", t("nav_all_orders")),
-        ("dispatch",   t("nav_dispatch")),
-        ("short_mgmt", t("nav_short_mgmt")),
-        ("arrivals",   t("nav_arrivals")),
+        ("shelf_mobile", t("nav_shelf_mobile")),
+        ("accounts",   t("nav_accounts")),
+        ("audit",      t("nav_audit_log")),
         ("inventory",  t("nav_inventory")),
         ("export",     t("nav_export")),
-        ("images",     t("nav_images")),
         ("backup",     t("nav_backup")),
-        ("email",      t("nav_email")),
         ("messages",   _nav_messages_label()),
         ("ai",         t("nav_ai")),
     ]
+    nav_from_sidebar = st.session_state.pop("_nav_from_sidebar", False)
+    if not nav_from_sidebar:
+        _apply_url_page_to_session(Role.ADMIN, ADMIN_PAGE_KEYS)
+    if (st.session_state.get("page") or "") not in ADMIN_PAGE_KEYS:
+        st.session_state.page = "dashboard"
+    _sync_browser_history_stack(
+        allowed=ADMIN_PAGE_KEYS,
+        current_page=st.session_state.page,
+        nav_from_sidebar=nav_from_sidebar,
+    )
     _render_sidebar_nav(nav_items)
     st.sidebar.divider()
     with st.sidebar:
@@ -6345,16 +9731,13 @@ def render_admin() -> None:
 
     pages = {
         "dashboard":  page_admin_dashboard,
-        "all_orders": page_admin_all_orders,
-        "dispatch":   page_warehouse_pending,    # admin reuses warehouse view
-        "short_mgmt": page_warehouse_shortages,  # ditto
-        "arrivals":   page_admin_arrivals,
+        "shelf_mobile": page_admin_shelf_mobile,
+        "accounts":   page_admin_accounts,
+        "audit":      page_admin_audit_log,
         "inventory":  page_admin_inventory,
         "export":     page_admin_export,
-        "images":     page_admin_images,
         "backup":     page_admin_backup,
-        "email":      page_admin_email,
-        "messages":   page_messages,
+        "messages":   page_admin_messages_center,
         "ai":         page_ai_assistant,
     }
     pages.get(st.session_state.page, page_admin_dashboard)()
@@ -6375,7 +9758,6 @@ def route() -> None:
         except Exception:
             nav = None
     if nav == "messages" and is_authenticated():
-        st.session_state.page = "messages"
         try:
             st.query_params.clear()
         except Exception:
@@ -6383,6 +9765,7 @@ def route() -> None:
                 st.experimental_set_query_params()
             except Exception:
                 pass
+        _set_session_page_for_app_nav("messages")
     if st.session_state.lang is None:
         page_pick_language()
         return

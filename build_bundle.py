@@ -7,9 +7,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# 源文件（请按需修改）
-SOURCE = Path(r"C:\Users\Administrator\Desktop\Supermarket\app.py")
+# 源文件固定为当前项目根目录的 app.py，避免误指向旧目录副本
 ROOT = Path(__file__).resolve().parent
+SOURCE = ROOT / "app.py"
 
 # 输出文件路径 -> (起始行, 结束行) 均为 1-based 闭区间
 CHUNKS: list[tuple[str, tuple[int, int]]] = [
