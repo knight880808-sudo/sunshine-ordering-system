@@ -16,6 +16,7 @@ import os
 import re
 import smtplib
 import sqlite3
+import socket
 import ssl
 import threading
 import traceback
@@ -1560,26 +1561,49 @@ def _send_smtp(
     pw = cfg.get("smtp_password") or ""
     use_tls = bool(cfg.get("use_tls", True))
 
-    try:
-        # Port 465 = implicit SSL; everything else uses STARTTLS when enabled
-        if port == 465:
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(host, port, context=ctx, timeout=15) as s:
-                if user:
-                    s.login(user, pw)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=15) as s:
-                s.ehlo()
-                if use_tls:
-                    s.starttls(context=ssl.create_default_context())
+    def _send_once(host_target: str) -> tuple[bool, str]:
+        try:
+            # Port 465 = implicit SSL; everything else uses STARTTLS when enabled
+            if port == 465:
+                ctx = ssl.create_default_context()
+                with smtplib.SMTP_SSL(host_target, port, context=ctx, timeout=15) as s:
+                    if user:
+                        s.login(user, pw)
+                    s.send_message(msg)
+            else:
+                with smtplib.SMTP(host_target, port, timeout=15) as s:
                     s.ehlo()
-                if user:
-                    s.login(user, pw)
-                s.send_message(msg)
+                    if use_tls:
+                        s.starttls(context=ssl.create_default_context())
+                        s.ehlo()
+                    if user:
+                        s.login(user, pw)
+                    s.send_message(msg)
+            return True, ""
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    ok, err = _send_once(host)
+    if ok:
         return True, ""
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+
+    # Some Windows/ISP networks resolve SMTP hosts to IPv6 first even when
+    # that route is unreachable (Errno 101). Retry with explicit IPv4 endpoint.
+    if "Network is unreachable" in err:
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            for info in infos:
+                ip = str(info[4][0] or "").strip()
+                if not ip:
+                    continue
+                ok2, err2 = _send_once(ip)
+                if ok2:
+                    return True, ""
+                err = err2
+        except Exception as e:
+            err = f"{err} | IPv4 fallback failed: {type(e).__name__}: {e}"
+
+    return False, err
 
 
 def _send_async(
