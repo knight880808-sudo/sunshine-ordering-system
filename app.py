@@ -38,28 +38,6 @@ from openpyxl.utils import get_column_letter
 # =========================================================================
 # CONFIG / CONSTANTS
 # =========================================================================
-
-# === STARTUP FILE DIAGNOSTIC (remove after debugging) ====================
-import logging as _diag_logging
-_diag_logging.basicConfig(level=_diag_logging.INFO)
-_diag_logger = _diag_logging.getLogger("STARTUP_CHECK")
-try:
-    _cwd = Path(".").resolve()
-    _diag_logger.info(f"[DIAG] CWD = {_cwd}")
-    _diag_logger.info(f"[DIAG] Files in CWD: {[f.name for f in Path('.').iterdir() if f.is_file()]}")
-    _p = Path("products.xlsx")
-    _diag_logger.info(f"[DIAG] products.xlsx exists={_p.exists()}, size={_p.stat().st_size if _p.exists() else 0}")
-    _glob_cn = list(Path(".").glob("商品档案_*.xlsx"))
-    _diag_logger.info(f"[DIAG] 商品档案 glob results: {[f.name for f in _glob_cn]}")
-    if _p.exists():
-        import pandas as _diag_pd
-        _df_check = _diag_pd.read_excel(_p, nrows=3)
-        _diag_logger.info(f"[DIAG] products.xlsx columns={list(_df_check.columns)}, rows_sample={len(_df_check)}")
-    _diag_logger.info("[DIAG] === END STARTUP CHECK ===")
-except Exception as _diag_e:
-    _diag_logger.error(f"[DIAG] Startup check failed: {_diag_e}")
-# === END DIAGNOSTIC ======================================================
-
 DB_PATH = Path("orders.db")
 
 
@@ -1382,6 +1360,21 @@ CREATE TABLE IF NOT EXISTS branch_cart_draft (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (account_id, branch)
 );
+
+CREATE TABLE IF NOT EXISTS product_catalog (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_code       TEXT,
+    barcode         TEXT,
+    name            TEXT    NOT NULL,
+    unit            TEXT,
+    price           REAL    NOT NULL DEFAULT 0,
+    category        TEXT    DEFAULT 'General',
+    pcs_per_carton  REAL    DEFAULT 0,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_product_catalog_item_code ON product_catalog(item_code);
+CREATE INDEX IF NOT EXISTS idx_product_catalog_barcode ON product_catalog(barcode);
 """
 
 
@@ -2972,6 +2965,73 @@ def load_products(
     Category is optional. When present, it's used to group items in the
     warehouse picking-slip exports (Frozen / Rice / Beverage / etc.).
     Items without a category fall back to 'General'."""
+
+    # === TRY DATABASE CATALOG FIRST ===
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT item_code, barcode, name, unit, price, category, pcs_per_carton "
+                "FROM product_catalog ORDER BY id"
+            ).fetchall()
+        if rows:
+            df = pd.DataFrame([dict(r) for r in rows])
+            df = df.rename(columns={
+                "item_code": "ItemCode", "barcode": "Barcode", "name": "Name",
+                "unit": "Unit", "price": "Price", "category": "Category",
+                "pcs_per_carton": "PcsPerCarton",
+            })
+            for c in ["ItemCode", "Barcode", "Name", "Unit", "Category"]:
+                df[c] = df[c].fillna("").astype(str).replace({"nan": "", "None": ""})
+            df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
+            df["PcsPerCarton"] = pd.to_numeric(df["PcsPerCarton"], errors="coerce").fillna(0.0)
+            for sc in ["StockCartons", "StockPcs", "StockTotal"]:
+                df[sc] = 0.0
+            # Overlay inventory from inventory table
+            try:
+                inv = conn.execute(
+                    "SELECT item_code, barcode, name, stock_cartons, stock_pcs FROM inventory"
+                ).fetchall()
+                inv_by_ic = {str(r["item_code"]).strip().lower(): r for r in inv if (r["item_code"] or "").strip()}
+                inv_by_bc = {str(r["barcode"]).strip().lower(): r for r in inv if (r["barcode"] or "").strip()}
+                inv_by_nm = {str(r["name"]).strip().lower(): r for r in inv if (r["name"] or "").strip()}
+                for idx, row in df.iterrows():
+                    ic = str(row.get("ItemCode", "") or "").strip().lower()
+                    bc = str(row.get("Barcode", "") or "").strip().lower()
+                    nm = str(row.get("Name", "") or "").strip().lower()
+                    hit = (inv_by_ic.get(ic) if ic else None) or \
+                          (inv_by_bc.get(bc) if bc else None) or \
+                          (inv_by_nm.get(nm) if nm else None)
+                    if hit:
+                        df.at[idx, "StockCartons"] = int(hit["stock_cartons"] or 0)
+                        df.at[idx, "StockPcs"] = int(hit["stock_pcs"] or 0)
+                df["StockTotal"] = pd.to_numeric(df["StockCartons"], errors="coerce").fillna(0) + \
+                                   pd.to_numeric(df["StockPcs"], errors="coerce").fillna(0)
+            except Exception:
+                pass
+            # Overlay prices from product_prices table
+            try:
+                price_rows = conn.execute(
+                    "SELECT item_code, barcode, name, price FROM product_prices"
+                ).fetchall()
+                by_ic = {str(r["item_code"]).strip().lower(): float(r["price"] or 0) for r in price_rows if (r["item_code"] or "").strip()}
+                by_bc = {str(r["barcode"]).strip().lower(): float(r["price"] or 0) for r in price_rows if (r["barcode"] or "").strip()}
+                by_nm = {str(r["name"]).strip().lower(): float(r["price"] or 0) for r in price_rows if (r["name"] or "").strip()}
+                for idx, row in df.iterrows():
+                    ic = str(row.get("ItemCode", "") or "").strip().lower()
+                    bc = str(row.get("Barcode", "") or "").strip().lower()
+                    nm = str(row.get("Name", "") or "").strip().lower()
+                    hit = (by_ic.get(ic) if ic else None) or (by_bc.get(bc) if bc else None) or (by_nm.get(nm) if nm else None)
+                    if hit is not None:
+                        df.at[idx, "Price"] = float(hit)
+            except Exception:
+                pass
+            df["_has_stock_info"] = True
+            df.loc[df["Category"].str.strip() == "", "Category"] = "General"
+            return df
+    except Exception:
+        pass  # Table might not exist yet, fall through to Excel
+    # === END DATABASE CATALOG ===
+
     master = products_master_excel_path()
     if not master.exists():
         demo = pd.DataFrame({
@@ -5048,7 +5108,7 @@ WAREHOUSE_PAGE_KEYS = frozenset({
     "pending", "short_in", "history", "supplier", "inventory", "messages", "ai",
 })
 ADMIN_PAGE_KEYS = frozenset({
-    "dashboard", "shelf_mobile", "accounts", "audit", "inventory",
+    "dashboard", "catalog", "shelf_mobile", "accounts", "audit", "inventory",
     "export", "backup", "messages", "ai",
 })
 
@@ -9022,6 +9082,195 @@ def _render_excel_import_feedback_panel(storage_key: str) -> None:
                 )
 
 
+def page_admin_product_catalog() -> None:
+    """管理员商品主档管理页面 - 从 Excel 导入商品到数据库"""
+    zh = st.session_state.get("lang") == "zh"
+    render_page_heading("📋 商品主档管理" if zh else "📋 Product Catalog")
+
+    st.info("📌 " + ("在此导入商品主档 Excel，导入后所有分店下单页面将显示这些商品。" if zh
+            else "Import product catalog Excel here. After import, all branch order pages will show these products."))
+
+    # --- 当前状态 ---
+    try:
+        with db_conn() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM product_catalog").fetchone()[0]
+        if count > 0:
+            st.success(f"✅ {'当前数据库中有' if zh else 'Database has'} **{count}** {'条商品记录' if zh else 'product records'}")
+        else:
+            st.warning("⚠️ " + ("数据库中没有商品记录，请导入商品主档。" if zh else "No products in database. Please import a catalog."))
+    except Exception:
+        st.warning("⚠️ " + ("商品表尚未创建，导入后将自动创建。" if zh else "Product table not yet created. Will be created on import."))
+        count = 0
+
+    # --- 导入 Excel ---
+    st.subheader("📥 " + ("导入商品 Excel" if zh else "Import Product Excel"))
+    st.caption("支持列名：商品编号/ItemCode, 条码/Barcode, 名称/Name, 零售价/价格/Price, 单位/Unit, 类别/Category, 每箱个数/PcsPerCarton"
+               if zh else "Supported columns: ItemCode, Barcode, Name, Price, Unit, Category, PcsPerCarton")
+
+    uploaded = st.file_uploader(
+        "选择 Excel 文件" if zh else "Choose Excel file",
+        type=["xlsx", "xls"],
+        key="catalog_uploader",
+    )
+
+    replace_mode = st.checkbox(
+        "🔄 " + ("清空旧数据后导入（替换模式）" if zh else "Clear old data before import (replace mode)"),
+        value=True,
+    )
+
+    if uploaded and st.button("🚀 " + ("开始导入" if zh else "Start Import"), type="primary"):
+        try:
+            raw_df = pd.read_excel(uploaded, dtype=str)
+            raw_df = raw_df.rename(columns=lambda c: str(c).replace("\ufeff", "").strip())
+
+            # Column mapping
+            col_lower = {str(c).strip().lower(): c for c in raw_df.columns}
+            renames = {}
+
+            ic_aliases = ["商品编号", "货号", "编号", "内部编号", "sku", "itemcode", "item_code"]
+            for a in ic_aliases:
+                hit = col_lower.get(a.lower())
+                if hit and hit != "ItemCode":
+                    renames[hit] = "ItemCode"
+                    break
+
+            bc_aliases = ["条码", "商品条码", "条形码", "barcode", "ean", "upc"]
+            for a in bc_aliases:
+                hit = col_lower.get(a.lower())
+                if hit and hit != "Barcode":
+                    renames[hit] = "Barcode"
+                    break
+
+            nm_aliases = ["商品名称", "名称", "品名", "name", "description"]
+            for a in nm_aliases:
+                hit = col_lower.get(a.lower())
+                if hit and hit != "Name":
+                    renames[hit] = "Name"
+                    break
+
+            price_aliases = ["零售价", "价格", "单价", "售价", "price", "unitprice", "unit_price",
+                             "listprice", "批发价", "进货价", "单价(元)", "价格(元)", "售价(元)"]
+            for a in price_aliases:
+                hit = col_lower.get(a.lower())
+                if hit and hit != "Price":
+                    renames[hit] = "Price"
+                    break
+
+            unit_aliases = ["单位", "unit", "计量单位"]
+            for a in unit_aliases:
+                hit = col_lower.get(a.lower())
+                if hit and hit != "Unit":
+                    renames[hit] = "Unit"
+                    break
+
+            cat_aliases = ["类别", "分类", "category", "商品分类"]
+            for a in cat_aliases:
+                hit = col_lower.get(a.lower())
+                if hit and hit != "Category":
+                    renames[hit] = "Category"
+                    break
+
+            ppc_aliases = ["每箱个数", "箱规", "箱装数", "pcspercarton", "packsize", "qtypercarton"]
+            for a in ppc_aliases:
+                hit = col_lower.get(a.lower())
+                if hit and hit != "PcsPerCarton":
+                    renames[hit] = "PcsPerCarton"
+                    break
+
+            if renames:
+                raw_df = raw_df.rename(columns=renames)
+
+            # Ensure required columns
+            if "Name" not in raw_df.columns:
+                st.error("❌ " + ("找不到商品名称列! 请确保 Excel 中有 名称 或 Name 列。" if zh
+                         else "Cannot find Name column! Ensure Excel has a 'Name' column."))
+                return
+
+            for col in ["ItemCode", "Barcode", "Unit", "Category"]:
+                if col not in raw_df.columns:
+                    raw_df[col] = ""
+            if "Price" not in raw_df.columns:
+                raw_df["Price"] = 0.0
+            if "PcsPerCarton" not in raw_df.columns:
+                raw_df["PcsPerCarton"] = 0.0
+
+            # Clean data
+            raw_df["Name"] = raw_df["Name"].fillna("").astype(str).str.strip()
+            raw_df = raw_df[raw_df["Name"] != ""]  # Remove rows without name
+
+            if raw_df.empty:
+                st.error("❌ " + ("Excel 中没有有效的商品数据（所有行的名称为空）。" if zh
+                         else "No valid product data in Excel (all Name fields are empty)."))
+                return
+
+            raw_df["Price"] = pd.to_numeric(raw_df["Price"], errors="coerce").fillna(0.0)
+            raw_df["PcsPerCarton"] = pd.to_numeric(raw_df["PcsPerCarton"], errors="coerce").fillna(0.0)
+
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            with db_conn() as conn:
+                if replace_mode:
+                    conn.execute("DELETE FROM product_catalog")
+
+                inserted = 0
+                for _, row in raw_df.iterrows():
+                    conn.execute(
+                        "INSERT INTO product_catalog (item_code, barcode, name, unit, price, category, pcs_per_carton, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            str(row.get("ItemCode", "") or "").strip(),
+                            str(row.get("Barcode", "") or "").strip(),
+                            str(row["Name"]).strip(),
+                            str(row.get("Unit", "") or "").strip(),
+                            float(row.get("Price", 0) or 0),
+                            str(row.get("Category", "General") or "General").strip(),
+                            float(row.get("PcsPerCarton", 0) or 0),
+                            now, now,
+                        )
+                    )
+                    inserted += 1
+
+            # Clear product cache
+            load_products.clear()
+
+            st.success(f"🎉 {'导入成功！共导入' if zh else 'Import successful! Imported'} **{inserted}** {'条商品记录。' if zh else ' product records.'}")
+            st.balloons()
+
+        except Exception as e:
+            st.error(f"❌ {'导入失败' if zh else 'Import failed'}: {e}")
+
+    # --- 查看当前商品 ---
+    if count > 0:
+        st.subheader("📊 " + ("当前商品预览（前 20 条）" if zh else "Current Products Preview (first 20)"))
+        try:
+            with db_conn() as conn:
+                preview = conn.execute(
+                    "SELECT item_code, barcode, name, price, category FROM product_catalog LIMIT 20"
+                ).fetchall()
+            preview_df = pd.DataFrame([dict(r) for r in preview])
+            preview_df.columns = ["商品编号" if zh else "ItemCode",
+                                  "条码" if zh else "Barcode",
+                                  "名称" if zh else "Name",
+                                  "价格" if zh else "Price",
+                                  "类别" if zh else "Category"]
+            st.dataframe(preview_df, use_container_width=True)
+        except Exception as e:
+            st.error(str(e))
+
+        # --- 清空按钮 ---
+        st.subheader("⚠️ " + ("危险操作" if zh else "Danger Zone"))
+        confirm = st.text_input("输入 CLEAR 确认清空" if zh else "Type CLEAR to confirm", key="catalog_clear_confirm")
+        if st.button("🗑️ " + ("清空全部商品" if zh else "Clear All Products"), type="secondary"):
+            if confirm.strip() == "CLEAR":
+                with db_conn() as conn:
+                    conn.execute("DELETE FROM product_catalog")
+                load_products.clear()
+                st.success("已清空" if zh else "Cleared")
+                st.rerun()
+            else:
+                st.warning("请输入 CLEAR 确认" if zh else "Please type CLEAR to confirm")
+
+
 def page_admin_price_management() -> None:
     render_section_title(f"💰 {t('nav_price')}")
     price_import_feedback_key = "_price_import_feedback"
@@ -9726,6 +9975,7 @@ def render_admin() -> None:
     st.sidebar.divider()
     nav_items = [
         ("dashboard",  t("nav_dashboard")),
+        ("catalog",    "📋 商品主档" if st.session_state.get("lang") == "zh" else "📋 Catalog"),
         ("shelf_mobile", t("nav_shelf_mobile")),
         ("accounts",   t("nav_accounts")),
         ("audit",      t("nav_audit_log")),
@@ -9753,6 +10003,7 @@ def render_admin() -> None:
 
     pages = {
         "dashboard":  page_admin_dashboard,
+        "catalog":    page_admin_product_catalog,
         "shelf_mobile": page_admin_shelf_mobile,
         "accounts":   page_admin_accounts,
         "audit":      page_admin_audit_log,
