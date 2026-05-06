@@ -1,4 +1,4 @@
-﻿"""
+"""
 SUNSHINE SHOPPING CENTER 订货系统 / Ordering System
 ====================================================
 Single-file Streamlit app.
