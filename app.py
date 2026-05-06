@@ -38,6 +38,28 @@ from openpyxl.utils import get_column_letter
 # =========================================================================
 # CONFIG / CONSTANTS
 # =========================================================================
+
+# === STARTUP FILE DIAGNOSTIC (remove after debugging) ====================
+import logging as _diag_logging
+_diag_logging.basicConfig(level=_diag_logging.INFO)
+_diag_logger = _diag_logging.getLogger("STARTUP_CHECK")
+try:
+    _cwd = Path(".").resolve()
+    _diag_logger.info(f"[DIAG] CWD = {_cwd}")
+    _diag_logger.info(f"[DIAG] Files in CWD: {[f.name for f in Path('.').iterdir() if f.is_file()]}")
+    _p = Path("products.xlsx")
+    _diag_logger.info(f"[DIAG] products.xlsx exists={_p.exists()}, size={_p.stat().st_size if _p.exists() else 0}")
+    _glob_cn = list(Path(".").glob("商品档案_*.xlsx"))
+    _diag_logger.info(f"[DIAG] 商品档案 glob results: {[f.name for f in _glob_cn]}")
+    if _p.exists():
+        import pandas as _diag_pd
+        _df_check = _diag_pd.read_excel(_p, nrows=3)
+        _diag_logger.info(f"[DIAG] products.xlsx columns={list(_df_check.columns)}, rows_sample={len(_df_check)}")
+    _diag_logger.info("[DIAG] === END STARTUP CHECK ===")
+except Exception as _diag_e:
+    _diag_logger.error(f"[DIAG] Startup check failed: {_diag_e}")
+# === END DIAGNOSTIC ======================================================
+
 DB_PATH = Path("orders.db")
 
 
