@@ -8,6 +8,7 @@ Run:
 """
 from __future__ import annotations
 
+import base64
 import html
 import io
 import hashlib
@@ -38,7 +39,38 @@ from openpyxl.utils import get_column_letter
 # =========================================================================
 # CONFIG / CONSTANTS
 # =========================================================================
-DB_PATH = Path("orders.db")
+def _resolve_storage_paths() -> tuple[Path, Path, Path, Path, Path]:
+    """Railway Volume: SUNSHINE_DATA_DIR=/data, DB_PATH=/data/orders.db (optional)."""
+    data_env = os.getenv("SUNSHINE_DATA_DIR", "").strip()
+    db_env = os.getenv("DB_PATH", "").strip()
+    data_root = Path(data_env) if data_env else Path(".")
+    if db_env:
+        db_path = Path(db_env)
+        if not data_env:
+            data_root = db_path.parent
+    else:
+        db_path = data_root / "orders.db"
+    for d in (data_root, db_path.parent):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return (
+        db_path,
+        data_root / "email_config.json",
+        data_root / "email_log.json",
+        data_root / "backups",
+        data_root / "app_runtime.log",
+    )
+
+
+(
+    DB_PATH,
+    EMAIL_CONFIG_PATH,
+    EMAIL_LOG_PATH,
+    BACKUP_DIR,
+    APP_LOG_PATH,
+) = _resolve_storage_paths()
 
 
 @dataclass
@@ -140,8 +172,9 @@ def _normalize_product_sheet_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = df.rename(columns=renames)
     return df
 
-# In-app page id for the browser address bar — enables mobile back/forward
-# between sidebar “pages” via the History API (parent window, not the iframe).
+# In-app page id in the address bar (?p=). Synced via st.query_params so the
+# browser back/forward button matches Streamlit session (do not push a second
+# history stack with window.history — that desyncs URL from page content).
 URL_PAGE_QUERY_KEY = "p"
 
 # Product image folder. File naming convention (in priority order):
@@ -153,18 +186,12 @@ URL_PAGE_QUERY_KEY = "p"
 # so a 10-item search page stays snappy on slow phone connections.
 IMAGES_DIR = Path("images")
 
-# Local DB backup directory. Used for both auto-snapshots (taken on startup
-# and throttled by BACKUP_MIN_INTERVAL_MINUTES) and manual admin backups.
-BACKUP_DIR = Path("backups")
+# BACKUP_DIR resolved with SUNSHINE_DATA_DIR (see _resolve_storage_paths).
 BACKUP_RETAIN = 30                    # keep at most this many auto-snapshots
 BACKUP_MIN_INTERVAL_MINUTES = 60      # auto-snapshot at most once per hour
 
-# Email notification config & log live in their own JSON files (NOT in the
-# SQLite DB) so backups of orders.db don't accidentally include SMTP creds.
-EMAIL_CONFIG_PATH = Path("email_config.json")
-EMAIL_LOG_PATH = Path("email_log.json")
+# Email paths resolved with DB_PATH / SUNSHINE_DATA_DIR above.
 EMAIL_LOG_KEEP = 200                  # keep last N log entries
-APP_LOG_PATH = Path("app_runtime.log")
 
 
 def _load_optional_env_file(path: Path) -> None:
@@ -217,6 +244,10 @@ GEMINI_FALLBACK_MODELS = os.getenv(
 ).strip()
 GEMINI_TIMEOUT_SEC = 20
 
+# Email: Resend HTTPS API works on Railway Hobby (SMTP 587/465 is blocked there).
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+RESEND_FROM = os.getenv("RESEND_FROM", "").strip()
+
 # Product images live as plain files in this folder. Filename convention:
 #   <ItemCode>.<ext>          e.g. P001.jpg
 #   bc_<Barcode>.<ext>        e.g. bc_8801234567001.jpg  (when no ItemCode)
@@ -241,6 +272,18 @@ ADMIN_PASSWORD = os.getenv("SUNSHINE_ADMIN_PASSWORD", "sunshine")
 # 管理员手机号（可选）：设置后，管理员登录须同时校验手机号与密码。支持多个号码用英文逗号分隔。
 # Comma-separated mobile numbers; when set, admin login requires matching phone + password.
 ADMIN_PHONE_ENV = os.getenv("SUNSHINE_ADMIN_PHONE", "").strip()
+
+# 临期预警天数：距离过期日 <= 该天数即触发预警。可用环境变量覆盖（默认 15 天）。
+# Expiry warning window in days; SUNSHINE_EXPIRY_WARN_DAYS overrides the default.
+EXPIRY_WARN_DAYS_DEFAULT = 15
+
+
+def expiry_warn_days() -> int:
+    """当前生效的预警天数（环境变量优先，非法值回退默认）。"""
+    raw = os.getenv("SUNSHINE_EXPIRY_WARN_DAYS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return EXPIRY_WARN_DAYS_DEFAULT
 
 
 def _normalize_phone_digits(raw: str) -> str:
@@ -310,6 +353,7 @@ T: dict[str, dict[str, str]] = {
     "app_subtitle":   {"en": "Ordering System",          "zh": "订货系统"},
     # Auth
     "select_role":    {"en": "Select your role",         "zh": "请选择您的角色"},
+    "back_to_roles":  {"en": "◀ Back to role selection",  "zh": "◀ 返回选择角色"},
     "role_branch":    {"en": "🛒 Branch Staff",           "zh": "🛒 分店员工"},
     "role_warehouse": {"en": "📦 Warehouse Staff",        "zh": "📦 仓库员工"},
     "role_admin":     {"en": "🏭 Administrator",          "zh": "🏭 管理员"},
@@ -453,6 +497,69 @@ T: dict[str, dict[str, str]] = {
     "st_rejected_acct": {"en": "Rejected",              "zh": "已拒绝"},
     # Nav
     "nav_order":      {"en": "🛒 Place Order",           "zh": "🛒 下单"},
+    "nav_stock":      {"en": "📅 Stock & Expiry",        "zh": "📅 库存/临期"},
+    "stock_subtitle": {"en": "Branch batch inventory with expiry alerts",
+                       "zh": "分店批次库存与临期/过期预警"},
+    "stock_add_title": {"en": "Receive a batch (in-stock)", "zh": "批次入库"},
+    "stock_pick_title": {"en": "Find from product library (or type manually below)",
+                         "zh": "从商品库搜索（也可在下方手工输入）"},
+    "stock_pick_ph":   {"en": "Search by name / barcode / item code",
+                        "zh": "按名称 / 条码 / 编号搜索"},
+    "stock_pick_select": {"en": "Select a product",       "zh": "选择商品"},
+    "stock_pick_fill": {"en": "⬇️ Fill into form",         "zh": "⬇️ 填入下方表单"},
+    "stock_pick_filled": {"en": "Filled. Adjust quantity & expiry below.",
+                          "zh": "已填入，请在下方填写数量和过期日期。"},
+    "stock_pick_clear": {"en": "🔄 Reset / type manually",
+                         "zh": "🔄 重选 / 手工输入"},
+    "stock_locked_hint": {"en": "Product filled from library (editable). "
+                                "Enter cartons / pieces / expiry.",
+                          "zh": "已从商品库带入（可微调）。请填写箱数 / 个数 / 过期日期。"},
+    "stock_need_expire": {"en": "Please choose an expiry date.",
+                          "zh": "请选择过期日期。"},
+    "stock_name":     {"en": "Product name",             "zh": "商品名称"},
+    "stock_code":     {"en": "Item code / barcode (optional)", "zh": "商品编号/条码（可选）"},
+    "stock_unit":     {"en": "Unit (optional)",          "zh": "单位（可选）"},
+    "stock_batch_no": {"en": "Batch no. (optional)",     "zh": "批次号（可选）"},
+    "stock_qty_ct":   {"en": "Cartons",                  "zh": "箱数"},
+    "stock_qty_pc":   {"en": "Pieces",                   "zh": "个数"},
+    "stock_expire":   {"en": "Expiration date",          "zh": "过期日期"},
+    "stock_add_btn":  {"en": "Add to branch stock",      "zh": "录入分店库存"},
+    "stock_add_ok":   {"en": "Batch added.",             "zh": "批次已入库。"},
+    "stock_list_title": {"en": "Current batches (this branch)", "zh": "本店当前批次"},
+    "stock_warn_title": {"en": "Expiring / expired soon", "zh": "临期 / 已过期"},
+    "stock_none":     {"en": "No batches yet.",          "zh": "暂无批次。"},
+    "stock_expired":  {"en": "EXPIRED",                  "zh": "已过期"},
+    "stock_days_left": {"en": "days left",               "zh": "天后过期"},
+    "stock_need_qty": {"en": "Quantity must be greater than 0.",
+                       "zh": "数量必须大于 0。"},
+    "nav_expiry_dash": {"en": "📅 Expiry Dashboard",     "zh": "📅 临期看板"},
+    "exp_dash_title": {"en": "Branch Stock & Expiry Dashboard",
+                       "zh": "全局分店库存与临期统计看板"},
+    "exp_dash_sub":   {"en": "Global expiry overview across all branches",
+                       "zh": "全网各分店库存临期/过期统计总览"},
+    "exp_filter_branch": {"en": "Branch filter",         "zh": "分店筛选"},
+    "exp_filter_cat":  {"en": "Category filter",         "zh": "商品分类筛选"},
+    "exp_kpi_branches": {"en": "Branches with stock",    "zh": "有库存分店数"},
+    "exp_kpi_units":   {"en": "Total stock units",       "zh": "全网总库存量"},
+    "exp_kpi_expired": {"en": "Expired items",           "zh": "已过期商品数"},
+    "exp_kpi_expiring": {"en": "Expiring soon",          "zh": "即将过期商品数"},
+    "exp_kpi_loss":    {"en": "Est. loss at risk",       "zh": "潜在损耗金额"},
+    "exp_chart_title": {"en": "Expiring / expired by branch", "zh": "各分店临期/过期数量对比"},
+    "exp_rank_title":  {"en": "Branch severity ranking",  "zh": "分店严重程度排行"},
+    "exp_loss_title":  {"en": "Potential loss ranking",   "zh": "潜在资金损耗排行"},
+    "exp_table_title": {"en": "Detail: batches across branches", "zh": "明细：各分店批次"},
+    "exp_col_branch":  {"en": "Branch",                  "zh": "分店"},
+    "exp_col_product": {"en": "Product",                 "zh": "商品名称"},
+    "exp_col_stock":   {"en": "Remaining stock",         "zh": "剩余库存"},
+    "exp_col_expire":  {"en": "Expire date",             "zh": "过期日期"},
+    "exp_col_daysleft": {"en": "Days left",              "zh": "剩余天数"},
+    "exp_col_manager": {"en": "Store manager",           "zh": "店长"},
+    "exp_col_cat":     {"en": "Category",                "zh": "分类"},
+    "exp_col_items":   {"en": "Items",                   "zh": "商品数"},
+    "exp_col_ratio":   {"en": "At-risk ratio",           "zh": "临期占比"},
+    "exp_only_risk":   {"en": "Show only expiring/expired",
+                        "zh": "只看临期/已过期"},
+    "exp_no_data":     {"en": "No batch data yet.",      "zh": "暂无批次数据。"},
     "nav_my_orders":  {"en": "📋 My Orders",             "zh": "📋 我的订单"},
     "nav_my_short":   {"en": "🔔 My Shortages",          "zh": "🔔 我的缺货"},
     "nav_pending":    {"en": "📦 Pending Dispatch",      "zh": "📦 待发货订单"},
@@ -924,6 +1031,9 @@ T: dict[str, dict[str, str]] = {
                           "zh": "没有商品填写数量。请先输入箱数或个数。"},
     "review_cart":       {"en": "📝 Review & Send Order",
                           "zh": "📝 确认并发送订单"},
+    "cart_checkout":     {"en": "🧾 Checkout", "zh": "🧾 去结算"},
+    "prod_date_opt":     {"en": "Production date (optional)",
+                          "zh": "生产日期（可选）"},
     "review_title":      {"en": "Review Your Order",
                           "zh": "确认订单"},
     "review_subtitle":   {"en": "Check each line, edit quantities or remove items, then send.",
@@ -1145,6 +1255,14 @@ T: dict[str, dict[str, str]] = {
                           "zh": "✅ 测试邮件发送成功"},
     "test_sent_fail":    {"en": "❌ Test email failed",
                           "zh": "❌ 测试邮件发送失败"},
+    "email_resend_active": {
+        "en": "Sending via **Resend API** (HTTPS). Railway Hobby/Fire plans cannot use Gmail SMTP on ports 587/465.",
+        "zh": "当前通过 **Resend API**（HTTPS）发信。Railway 的 Free/Hobby 套餐无法使用 Gmail 的 SMTP（587/465 端口被封锁）。",
+    },
+    "email_railway_smtp_hint": {
+        "en": "On Railway Free/Hobby, outbound SMTP is blocked. Either upgrade to **Pro** and redeploy, or set `RESEND_API_KEY` + `RESEND_FROM` in Railway Variables (see README).",
+        "zh": "Railway 的 Free/Hobby 会封锁出站 SMTP。请二选一：① 升级到 **Pro** 并 Redeploy；② 在 Railway Variables 设置 `RESEND_API_KEY` 与 `RESEND_FROM`（见 README）。",
+    },
     "email_log_title":   {"en": "Recent Email Activity",
                           "zh": "近期邮件记录"},
     "email_log_empty":   {"en": "No email activity yet",
@@ -1316,6 +1434,9 @@ CREATE TABLE IF NOT EXISTS product_prices (
     updated_at      TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_product_prices_updated ON product_prices(updated_at DESC);
+-- 临期看板按 item_code/barcode 关联取价，加索引避免全表扫描。
+CREATE INDEX IF NOT EXISTS idx_product_prices_item_code ON product_prices(item_code);
+CREATE INDEX IF NOT EXISTS idx_product_prices_barcode ON product_prices(barcode);
 
 CREATE TABLE IF NOT EXISTS user_accounts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1375,6 +1496,40 @@ CREATE TABLE IF NOT EXISTS product_catalog (
 );
 CREATE INDEX IF NOT EXISTS idx_product_catalog_item_code ON product_catalog(item_code);
 CREATE INDEX IF NOT EXISTS idx_product_catalog_barcode ON product_catalog(barcode);
+CREATE INDEX IF NOT EXISTS idx_product_catalog_category ON product_catalog(category);
+
+-- =========================================================
+-- BRANCH_INVENTORY_BATCHES  (分店批次库存 + 过期预警)
+-- 各分店独立持有；一行 = 某分店某商品的一个批次（带过期日期）。
+-- 与中央 inventory 表互不影响：inventory 仍是仓库权威库存，
+-- 本表面向"分店货架上的实际批次"做临期/过期管理。
+-- =========================================================
+CREATE TABLE IF NOT EXISTS branch_inventory_batches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch          TEXT    NOT NULL,            -- 分店ID（须属于 BRANCHES）
+    item_code       TEXT,
+    barcode         TEXT,
+    name            TEXT    NOT NULL,
+    unit            TEXT,
+    batch_no        TEXT,                         -- 批次号（可选，便于追溯）
+    qty_cartons     INTEGER NOT NULL DEFAULT 0,   -- 该批次剩余库存（箱）
+    qty_pcs         INTEGER NOT NULL DEFAULT 0,   -- 该批次剩余库存（个）
+    production_date TEXT,                          -- 生产/入库日期 YYYY-MM-DD（可选）
+    shelf_life_days INTEGER,                       -- 保质期天数（可选）
+    expire_date     TEXT    NOT NULL,             -- 过期日期 YYYY-MM-DD（核心，必填）
+    status          TEXT    NOT NULL DEFAULT 'active',  -- active / depleted / discarded
+    received_by     TEXT,
+    note            TEXT,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL
+);
+-- 临期扫描的核心查询：按分店 + 状态 + 过期日期范围过滤。
+CREATE INDEX IF NOT EXISTS idx_batch_branch_expire
+ON branch_inventory_batches(branch, status, expire_date);
+CREATE INDEX IF NOT EXISTS idx_batch_expire
+ON branch_inventory_batches(expire_date);
+CREATE INDEX IF NOT EXISTS idx_batch_item
+ON branch_inventory_batches(item_code, barcode);
 """
 
 
@@ -2157,6 +2312,570 @@ def _apply_inventory_change(
     return after_ct, after_pc
 
 
+# =========================================================================
+# 分店批次库存 & 临期/过期预警 (Branch batch inventory & expiry alerts)
+# =========================================================================
+def _parse_ymd(value: str) -> datetime | None:
+    """把 'YYYY-MM-DD' 解析为 datetime；非法返回 None。"""
+    s = (value or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def compute_expire_date(
+    production_date: str = "",
+    shelf_life_days: int | None = None,
+    explicit_expire: str = "",
+) -> str:
+    """计算过期日期，返回 'YYYY-MM-DD'。
+
+    优先级：
+      1. 直接给定过期日期 explicit_expire（最权威）。
+      2. 否则用 生产/入库日期 + 保质期天数 推算。
+    两者都缺则抛 ValueError —— 入库必须能确定过期日期。
+    """
+    exp = _parse_ymd(explicit_expire)
+    if exp is not None:
+        return exp.strftime("%Y-%m-%d")
+    prod = _parse_ymd(production_date)
+    if prod is not None and shelf_life_days is not None and int(shelf_life_days) >= 0:
+        return (prod + timedelta(days=int(shelf_life_days))).strftime("%Y-%m-%d")
+    raise ValueError("必须提供过期日期，或同时提供生产日期与保质期天数")
+
+
+def add_branch_batch(
+    *,
+    branch: str,
+    name: str,
+    item_code: str = "",
+    barcode: str = "",
+    unit: str = "",
+    qty_cartons: int = 0,
+    qty_pcs: int = 0,
+    production_date: str = "",
+    shelf_life_days: int | None = None,
+    expire_date: str = "",
+    batch_no: str = "",
+    received_by: str = "",
+    note: str = "",
+) -> int:
+    """入库/调拨：把一个批次商品写入指定分店的批次库存。
+
+    - 强制要求 branch 属于 BRANCHES、name 非空、库存为正、且能确定过期日期。
+    - 返回新批次行 id。失败抛 ValueError。
+    """
+    branch = (branch or "").strip()
+    if branch not in BRANCHES:
+        raise ValueError(f"未知分店: {branch}")
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("商品名称不能为空")
+    qc, qp = int(qty_cartons or 0), int(qty_pcs or 0)
+    if qc < 0 or qp < 0 or (qc == 0 and qp == 0):
+        raise ValueError("入库数量必须大于 0")
+    # 入库接口强制要求过期日期（可直接给，或由生产日期+保质期推算）。
+    expire = compute_expire_date(production_date, shelf_life_days, expire_date)
+    ts = now_str()
+    with db_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO branch_inventory_batches
+            (branch, item_code, barcode, name, unit, batch_no,
+             qty_cartons, qty_pcs, production_date, shelf_life_days,
+             expire_date, status, received_by, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+            """,
+            (
+                branch,
+                (item_code or "").strip() or None,
+                (barcode or "").strip() or None,
+                name,
+                (unit or "").strip() or None,
+                (batch_no or "").strip() or None,
+                qc,
+                qp,
+                (production_date or "").strip() or None,
+                int(shelf_life_days) if shelf_life_days is not None else None,
+                expire,
+                (received_by or "").strip() or None,
+                (note or "").strip() or None,
+                ts,
+                ts,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def scan_expiring_batches(
+    warn_days: int | None = None,
+    today: str = "",
+) -> dict[str, list[sqlite3.Row]]:
+    """扫描所有分店，找出临期/已过期且仍有库存的活动批次，按分店归类。
+
+    判定条件（与需求一致）：
+      当前日期 + 预警天数 >= 过期日期  ⇔  过期日期 <= 当前日期 + 预警天数
+      且 status='active' 且 (qty_cartons > 0 或 qty_pcs > 0)
+
+    返回: { 分店ID: [批次行, ...] }，每个分店内部按过期日期升序（最紧急在前）。
+    """
+    days = expiry_warn_days() if warn_days is None else int(warn_days)
+    base = _parse_ymd(today) or datetime.now()
+    # 阈值日期：过期日期 <= 该日期即纳入预警（含已过期）。
+    threshold = (base + timedelta(days=days)).strftime("%Y-%m-%d")
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM branch_inventory_batches
+            WHERE status = 'active'
+              AND (qty_cartons > 0 OR qty_pcs > 0)
+              AND expire_date <= ?
+            ORDER BY branch ASC, expire_date ASC
+            """,
+            (threshold,),
+        ).fetchall()
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for r in rows:
+        grouped.setdefault(r["branch"], []).append(r)
+    return grouped
+
+
+def _format_expiry_lines(batches: list[sqlite3.Row], today_dt: datetime) -> str:
+    """把某分店的临期批次拼成可读的多行文本（用于消息中心与邮件正文）。"""
+    lines: list[str] = []
+    for b in batches:
+        exp = _parse_ymd(b["expire_date"])
+        days_left = (exp - today_dt).days if exp else None
+        if days_left is None:
+            tag = ""
+        elif days_left < 0:
+            tag = f"（已过期 {abs(days_left)} 天）"
+        elif days_left == 0:
+            tag = "（今天到期）"
+        else:
+            tag = f"（剩 {days_left} 天）"
+        qty_parts = []
+        if int(b["qty_cartons"] or 0) > 0:
+            qty_parts.append(f"{int(b['qty_cartons'])} 箱")
+        if int(b["qty_pcs"] or 0) > 0:
+            qty_parts.append(f"{int(b['qty_pcs'])} 个")
+        qty_txt = " ".join(qty_parts) or "0"
+        code = (b["item_code"] or b["barcode"] or "").strip()
+        code_txt = f" [{code}]" if code else ""
+        lines.append(
+            f"- {b['name']}{code_txt} · 库存 {qty_txt} · 过期 {b['expire_date']} {tag}"
+        )
+    return "\n".join(lines)
+
+
+def run_expiry_scan_and_notify(
+    warn_days: int | None = None,
+    today: str = "",
+    send_email: bool = True,
+) -> dict:
+    """临期预警主流程（供定时任务调用）：
+
+      1. 扫描临期/过期批次并按分店归类。
+      2. 每个有临期商品的分店：写一条消息中心通知（target=该分店）。
+      3. 如配置了店长邮箱（email_config.branch_emails[branch]），发邮件。
+      4. 给管理员写一条汇总通知。
+
+    返回执行汇总（便于日志/控制台输出）。本函数尽量不抛异常。
+    """
+    days = expiry_warn_days() if warn_days is None else int(warn_days)
+    today_dt = _parse_ymd(today) or datetime.now()
+    today_label = today_dt.strftime("%Y-%m-%d")
+    grouped = scan_expiring_batches(days, today_label)
+
+    summary = {
+        "ran_at": now_str(),
+        "warn_days": days,
+        "branches_alerted": 0,
+        "items_total": 0,
+        "emails_sent": 0,
+        "details": {},
+    }
+    if not grouped:
+        return summary
+
+    try:
+        cfg = load_email_config()
+    except Exception as e:
+        log_exception("expiry_load_email_config", e)
+        cfg = {}
+    branch_emails = (cfg.get("branch_emails") or {}) if isinstance(cfg, dict) else {}
+
+    admin_lines: list[str] = []
+    for branch, batches in grouped.items():
+        body = _format_expiry_lines(batches, today_dt)
+        title = f"⚠️ 临期/过期预警：{len(batches)} 项商品（{branch}）"
+        message = (
+            f"以下商品距离过期 ≤ {days} 天（或已过期），请尽快处理：\n\n{body}"
+        )
+        # 2) 消息中心：发往该分店
+        create_notification(
+            event_type="expiry_alert",
+            title=title,
+            message=message,
+            target_role=Role.BRANCH,
+            target_branch=branch,
+        )
+        # 3) 邮件：发往店长邮箱（若已配置）
+        addr = (branch_emails.get(branch) or "").strip()
+        if send_email and addr:
+            subject = f"[SUNSHINE 临期预警] {branch} · {len(batches)} 项商品"
+            notify(
+                "expiry_alert",
+                subject,
+                f"分店：{branch}\n预警天数：{days} 天\n日期：{today_label}\n\n{message}",
+                extra_to=[addr],
+            )
+            summary["emails_sent"] += 1
+
+        summary["branches_alerted"] += 1
+        summary["items_total"] += len(batches)
+        summary["details"][branch] = len(batches)
+        admin_lines.append(f"{branch}: {len(batches)} 项")
+
+    # 4) 管理员汇总
+    create_notification(
+        event_type="expiry_alert",
+        title=f"⚠️ 临期预警汇总：{summary['items_total']} 项 / {summary['branches_alerted']} 家分店",
+        message="各分店临期/过期商品数量：\n" + "\n".join(admin_lines),
+        target_role=Role.ADMIN,
+    )
+    return summary
+
+
+# =========================================================================
+# 管理员临期看板 · 统计接口 (Admin expiry dashboard analytics)
+# =========================================================================
+# 设计要点：
+#   - 全部用单条聚合 SQL（COUNT/SUM/CASE WHEN）在数据库内算好再返回，
+#     避免把大量批次行拉到 Python 里循环。
+#   - JOIN 商品主档 product_catalog（取分类、每箱个数），并用相关子查询
+#     取生效价（product_prices 覆盖优先，回退 product_catalog 价）。
+#   - catalog JOIN 用"单行匹配子查询(pc.id = (SELECT ... LIMIT 1))"，
+#     防止 item_code/barcode 双键 OR 关联产生行膨胀（重复计数）。
+
+# 单品有效数量（统一折算为"个"当量）：个数 + 箱数 × 每箱个数（未知按 1 估）。
+_EXPIRY_UNITS_SQL = (
+    "(b.qty_pcs + b.qty_cartons * COALESCE(NULLIF(pc.pcs_per_carton, 0), 1))"
+)
+
+# catalog 单行匹配（避免 OR 双键 JOIN 的行膨胀）。
+_EXPIRY_CATALOG_JOIN = (
+    "LEFT JOIN product_catalog pc ON pc.id = ("
+    "  SELECT c.id FROM product_catalog c"
+    "  WHERE (b.item_code IS NOT NULL AND b.item_code <> '' AND c.item_code = b.item_code)"
+    "     OR (b.barcode  IS NOT NULL AND b.barcode  <> '' AND c.barcode  = b.barcode)"
+    "  LIMIT 1)"
+)
+
+# 生效单价：价格覆盖表优先，其次主档价，最后 0。
+_EXPIRY_PRICE_SQL = (
+    "COALESCE("
+    "  (SELECT pr.price FROM product_prices pr"
+    "   WHERE (b.item_code IS NOT NULL AND b.item_code <> '' AND pr.item_code = b.item_code)"
+    "      OR (b.barcode  IS NOT NULL AND b.barcode  <> '' AND pr.barcode  = b.barcode)"
+    "   LIMIT 1),"
+    "  pc.price, 0)"
+)
+
+
+def _expiry_filter_clause(
+    branch_filter: list[str] | None,
+    category_filter: str | None,
+) -> tuple[str, dict]:
+    """构造 WHERE 过滤（分店多选 + 分类），返回 (sql, params)。"""
+    clauses = ["b.status = 'active'", "(b.qty_cartons > 0 OR b.qty_pcs > 0)"]
+    params: dict = {}
+    if branch_filter:
+        placeholders = ",".join(f":br{i}" for i in range(len(branch_filter)))
+        clauses.append(f"b.branch IN ({placeholders})")
+        for i, br in enumerate(branch_filter):
+            params[f"br{i}"] = br
+    if category_filter:
+        clauses.append("pc.category = :cat")
+        params["cat"] = category_filter
+    return " AND ".join(clauses), params
+
+
+def admin_expiry_branch_stats(
+    warn_days: int | None = None,
+    branch_filter: list[str] | None = None,
+    category_filter: str | None = None,
+    today: str = "",
+) -> list[dict]:
+    """各分店临期统计（一次聚合查询，按分店一行）。
+
+    返回每分店：批次数、总库存当量、已过期数、临期数、临期占比、潜在损耗金额。
+    """
+    days = expiry_warn_days() if warn_days is None else int(warn_days)
+    base = _parse_ymd(today) or datetime.now()
+    today_label = base.strftime("%Y-%m-%d")
+    threshold = (base + timedelta(days=days)).strftime("%Y-%m-%d")
+    where, params = _expiry_filter_clause(branch_filter, category_filter)
+    params.update({"today": today_label, "threshold": threshold})
+    sql = f"""
+        SELECT
+            b.branch AS branch,
+            COUNT(*) AS batch_count,
+            SUM({_EXPIRY_UNITS_SQL}) AS total_units,
+            SUM(CASE WHEN b.expire_date <= :today THEN 1 ELSE 0 END) AS expired_n,
+            SUM(CASE WHEN b.expire_date > :today AND b.expire_date <= :threshold
+                     THEN 1 ELSE 0 END) AS expiring_n,
+            SUM(CASE WHEN b.expire_date <= :threshold
+                     THEN {_EXPIRY_UNITS_SQL} * {_EXPIRY_PRICE_SQL}
+                     ELSE 0 END) AS loss_value
+        FROM branch_inventory_batches b
+        {_EXPIRY_CATALOG_JOIN}
+        WHERE {where}
+        GROUP BY b.branch
+        ORDER BY expired_n DESC, expiring_n DESC
+    """
+    with db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        bc = int(r["batch_count"] or 0)
+        risk = int(r["expired_n"] or 0) + int(r["expiring_n"] or 0)
+        out.append({
+            "branch": r["branch"],
+            "batch_count": bc,
+            "total_units": int(r["total_units"] or 0),
+            "expired_n": int(r["expired_n"] or 0),
+            "expiring_n": int(r["expiring_n"] or 0),
+            "risk_n": risk,
+            "risk_ratio": (risk / bc) if bc else 0.0,
+            "loss_value": round(float(r["loss_value"] or 0), 2),
+        })
+    return out
+
+
+def admin_expiry_overview(
+    warn_days: int | None = None,
+    branch_filter: list[str] | None = None,
+    category_filter: str | None = None,
+    today: str = "",
+) -> dict:
+    """全局总览 KPI（基于分店聚合结果二次汇总；分店数 ≤ 7，开销极小）。"""
+    stats = admin_expiry_branch_stats(warn_days, branch_filter, category_filter, today)
+    return {
+        "total_branches": len(BRANCHES),
+        "branches_with_stock": len(stats),
+        "total_units": sum(s["total_units"] for s in stats),
+        "total_batches": sum(s["batch_count"] for s in stats),
+        "expired_total": sum(s["expired_n"] for s in stats),
+        "expiring_total": sum(s["expiring_n"] for s in stats),
+        "loss_total": round(sum(s["loss_value"] for s in stats), 2),
+        "stats": stats,
+    }
+
+
+def admin_product_categories() -> list[str]:
+    """商品主档里出现过的分类（用于看板筛选下拉）。"""
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT category FROM product_catalog "
+                "WHERE category IS NOT NULL AND category <> '' ORDER BY category"
+            ).fetchall()
+        return [r["category"] for r in rows]
+    except Exception:
+        return []
+
+
+def _branch_manager_label(branch: str, branch_emails: dict | None = None) -> str:
+    """店长信息：姓名取该分店一个已审核账号的显示名，联系方式取 branch_emails。
+
+    系统未单独存"店长姓名"字段，这里用已审核分店账号的 display_name 近似，
+    并附上邮箱联系方式。两者皆空则返回 '-'。
+    """
+    name = ""
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT display_name, username FROM user_accounts "
+                "WHERE branch = ? AND status = 'approved' "
+                "ORDER BY created_at ASC LIMIT 1",
+                (branch,),
+            ).fetchone()
+        if row:
+            name = (row["display_name"] or row["username"] or "").strip()
+    except Exception:
+        pass
+    if branch_emails is None:
+        try:
+            branch_emails = (load_email_config().get("branch_emails") or {})
+        except Exception:
+            branch_emails = {}
+    email = (branch_emails.get(branch) or "").strip()
+    if name and email:
+        return f"{name} · {email}"
+    return name or email or "-"
+
+
+def admin_expiry_detail_rows(
+    warn_days: int | None = None,
+    branch_filter: list[str] | None = None,
+    category_filter: str | None = None,
+    only_risk: bool = False,
+    today: str = "",
+    limit: int = 1000,
+) -> list[sqlite3.Row]:
+    """看板主数据表的明细行（带分类、生效单价；按过期日期升序）。"""
+    days = expiry_warn_days() if warn_days is None else int(warn_days)
+    base = _parse_ymd(today) or datetime.now()
+    threshold = (base + timedelta(days=days)).strftime("%Y-%m-%d")
+    where, params = _expiry_filter_clause(branch_filter, category_filter)
+    params.update({"threshold": threshold, "limit": int(limit)})
+    risk_clause = " AND b.expire_date <= :threshold" if only_risk else ""
+    sql = f"""
+        SELECT b.branch, b.name, b.item_code, b.barcode, b.unit,
+               b.qty_cartons, b.qty_pcs, b.expire_date,
+               pc.category AS category,
+               {_EXPIRY_PRICE_SQL} AS unit_price
+        FROM branch_inventory_batches b
+        {_EXPIRY_CATALOG_JOIN}
+        WHERE {where}{risk_clause}
+        ORDER BY b.expire_date ASC
+        LIMIT :limit
+    """
+    with db_conn() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def page_admin_expiry_dashboard() -> None:
+    """管理员：全局分店库存与临期统计看板。"""
+    render_page_heading(t("exp_dash_title"), t("exp_dash_sub"))
+    warn_days = expiry_warn_days()
+
+    # ---- 筛选条 ----
+    cats = admin_product_categories()
+    fc1, fc2, fc3 = st.columns([2, 2, 1])
+    sel_branches = fc1.multiselect(t("exp_filter_branch"), BRANCHES, default=[])
+    sel_cat = fc2.selectbox(t("exp_filter_cat"), ["—"] + cats, index=0)
+    only_risk = fc3.checkbox(t("exp_only_risk"), value=False)
+    branch_filter = sel_branches or None
+    category_filter = None if sel_cat in ("—", "") else sel_cat
+
+    ov = admin_expiry_overview(warn_days, branch_filter, category_filter)
+    stats = ov["stats"]
+
+    # ---- KPI 卡片 ----
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric(t("exp_kpi_branches"), f"{ov['branches_with_stock']}/{ov['total_branches']}")
+    k2.metric(t("exp_kpi_units"), f"{ov['total_units']:,}")
+    k3.metric(t("exp_kpi_expired"), f"{ov['expired_total']:,}")
+    k4.metric(t("exp_kpi_expiring"), f"{ov['expiring_total']:,}")
+    k5.metric(t("exp_kpi_loss"), f"{ov['loss_total']:,.0f}")
+
+    if not stats:
+        st.info(t("exp_no_data"))
+        return
+
+    # ---- 各分店临期/过期对比图（Streamlit 原生柱状图）----
+    st.markdown(f"#### {t('exp_chart_title')}")
+    chart_df = pd.DataFrame(
+        [
+            {
+                "branch": s["branch"],
+                t("exp_kpi_expired"): s["expired_n"],
+                t("exp_kpi_expiring"): s["expiring_n"],
+            }
+            for s in stats
+        ]
+    ).set_index("branch")
+    st.bar_chart(chart_df)
+
+    # ---- 分店严重程度排行 ----
+    st.markdown(f"#### {t('exp_rank_title')}")
+    rank = sorted(
+        stats,
+        key=lambda s: (s["expired_n"], s["risk_n"], s["loss_value"]),
+        reverse=True,
+    )
+    st.dataframe(
+        pd.DataFrame([
+            {
+                t("exp_col_branch"): s["branch"],
+                t("exp_col_items"): s["batch_count"],
+                t("exp_kpi_expired"): s["expired_n"],
+                t("exp_kpi_expiring"): s["expiring_n"],
+                t("exp_col_ratio"): f"{s['risk_ratio'] * 100:.0f}%",
+                t("exp_kpi_loss"): f"{s['loss_value']:,.0f}",
+            }
+            for s in rank
+        ]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ---- 潜在损耗排行 ----
+    st.markdown(f"#### {t('exp_loss_title')}")
+    loss_rank = sorted(stats, key=lambda s: s["loss_value"], reverse=True)
+    st.dataframe(
+        pd.DataFrame([
+            {
+                t("exp_col_branch"): s["branch"],
+                t("exp_kpi_loss"): f"{s['loss_value']:,.0f}",
+                t("exp_kpi_expired"): s["expired_n"],
+                t("exp_kpi_expiring"): s["expiring_n"],
+            }
+            for s in loss_rank
+        ]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ---- 全局明细表 ----
+    st.markdown(f"#### {t('exp_table_title')}")
+    rows = admin_expiry_detail_rows(
+        warn_days, branch_filter, category_filter, only_risk=only_risk
+    )
+    if not rows:
+        st.info(t("exp_no_data"))
+        return
+    try:
+        bemails = (load_email_config().get("branch_emails") or {})
+    except Exception:
+        bemails = {}
+    today = datetime.now().date()
+    mgr_cache: dict[str, str] = {}
+    table = []
+    for r in rows:
+        exp = _parse_ymd(r["expire_date"])
+        dl = (exp.date() - today).days if exp else None
+        if dl is None:
+            days_txt = ""
+        elif dl < 0:
+            days_txt = t("stock_expired")
+        else:
+            days_txt = str(dl)
+        stock_parts = []
+        if int(r["qty_cartons"] or 0) > 0:
+            stock_parts.append(f"{int(r['qty_cartons'])} {t('stock_qty_ct')}")
+        if int(r["qty_pcs"] or 0) > 0:
+            stock_parts.append(f"{int(r['qty_pcs'])} {t('stock_qty_pc')}")
+        br = r["branch"]
+        if br not in mgr_cache:
+            mgr_cache[br] = _branch_manager_label(br, bemails)
+        table.append({
+            t("exp_col_branch"): br,
+            t("exp_col_product"): r["name"],
+            t("exp_col_cat"): r["category"] or "",
+            t("exp_col_stock"): " / ".join(stock_parts) or "0",
+            t("exp_col_expire"): r["expire_date"],
+            t("exp_col_daysleft"): days_txt,
+            t("exp_col_manager"): mgr_cache[br],
+        })
+    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+
+
 def _notification_target_filter_sql(role: str, branch: str | None) -> tuple[str, tuple]:
     if role == Role.BRANCH:
         return (
@@ -2547,7 +3266,7 @@ def restore_from_sql_dump(sql_bytes: bytes) -> Path:
 #   5. Test-send button so the operator can verify SMTP without triggering a
 #      real order.
 
-EVENT_KEYS = ("new_order", "dispatched", "shortage", "supplier_order")
+EVENT_KEYS = ("new_order", "dispatched", "shortage", "supplier_order", "expiry_alert")
 
 
 def _default_email_config() -> dict:
@@ -2564,6 +3283,8 @@ def _default_email_config() -> dict:
             "dispatched": {"enabled": True, "to": []},
             "shortage":   {"enabled": True, "to": []},
             "supplier_order": {"enabled": True, "to": []},
+            # 临期/过期预警：每天定时扫描后，按分店发往店长邮箱（branch_emails）。
+            "expiry_alert": {"enabled": True, "to": []},
         },
         # Optional per-branch recipient — a "dispatched" event for a given
         # branch will additionally CC the address listed here.
@@ -2571,17 +3292,63 @@ def _default_email_config() -> dict:
     }
 
 
+def _env_bool(name: str) -> bool | None:
+    v = os.getenv(name, "").strip().lower()
+    if not v:
+        return None
+    return v in ("1", "true", "yes", "on")
+
+
+def _apply_email_env_overrides(cfg: dict) -> dict:
+    """Production (e.g. Railway): SMTP/recipients from env when JSON is absent.
+
+    Env vars override file values when set (same precedence as GEMINI_*)."""
+    en = _env_bool("SUNSHINE_EMAIL_ENABLED")
+    if en is not None:
+        cfg["enabled"] = en
+    for key, env_name in (
+        ("smtp_host", "SUNSHINE_SMTP_HOST"),
+        ("smtp_user", "SUNSHINE_SMTP_USER"),
+        ("smtp_password", "SUNSHINE_SMTP_PASSWORD"),
+        ("from_addr", "SUNSHINE_SMTP_FROM"),
+    ):
+        v = os.getenv(env_name, "").strip()
+        if v:
+            cfg[key] = v
+    pw_env = os.getenv("SUNSHINE_SMTP_PASSWORD", "").strip()
+    if pw_env:
+        cfg["smtp_password"] = _normalize_smtp_password(pw_env)
+    port_s = os.getenv("SUNSHINE_SMTP_PORT", "").strip()
+    if port_s.isdigit():
+        cfg["smtp_port"] = int(port_s)
+    tls = _env_bool("SUNSHINE_SMTP_USE_TLS")
+    if tls is not None:
+        cfg["use_tls"] = tls
+    to_all = os.getenv("SUNSHINE_EMAIL_NOTIFY_TO", "").strip()
+    if to_all:
+        addrs = [a.strip() for a in to_all.split(",") if a.strip()]
+        if addrs:
+            for ev in EVENT_KEYS:
+                cfg["events"][ev]["to"] = list(addrs)
+                cfg["events"][ev]["enabled"] = True
+    return cfg
+
+
 def load_email_config() -> dict:
     """Load config from disk; merge with defaults so a missing field never
     crashes the page."""
     base = _default_email_config()
     if not EMAIL_CONFIG_PATH.exists():
-        return base
+        merged = dict(base)
+        merged["events"] = {k: dict(v) for k, v in base["events"].items()}
+        return _apply_email_env_overrides(merged)
     try:
         with EMAIL_CONFIG_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return base
+        merged = dict(base)
+        merged["events"] = {k: dict(v) for k, v in base["events"].items()}
+        return _apply_email_env_overrides(merged)
     # Shallow-merge top-level, deep-merge events
     merged = {**base, **data}
     merged_events = base["events"].copy()
@@ -2590,7 +3357,7 @@ def load_email_config() -> dict:
             merged_events[k] = {**merged_events[k], **v}
     merged["events"] = merged_events
     merged["branch_emails"] = data.get("branch_emails", {}) or {}
-    return merged
+    return _apply_email_env_overrides(merged)
 
 
 def save_email_config(cfg: dict) -> None:
@@ -2637,6 +3404,93 @@ def load_email_log() -> list[dict]:
 
 
 # --- Sending --------------------------------------------------------------
+def _normalize_smtp_password(pw: str) -> str:
+    """Gmail app passwords are often shown with spaces — strip them."""
+    return re.sub(r"\s+", "", (pw or ""))
+
+
+def _railway_smtp_blocked_hint(err: str) -> str:
+    low = (err or "").lower()
+    if any(
+        x in low
+        for x in (
+            "timed out", "timeout", "unreachable", "network is unreachable",
+            "errno 101", "[errno 101]",
+        )
+    ):
+        return " " + t("email_railway_smtp_hint")
+    return ""
+
+
+def _send_resend_api(
+    cfg: dict,
+    to: list[str],
+    subject: str,
+    body: str,
+    attachments: list[tuple[str, bytes, str]] | None = None,
+) -> tuple[bool, str]:
+    """HTTPS email — works on Railway when SMTP ports are blocked."""
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY not set"
+    from_addr = (RESEND_FROM or (cfg.get("from_addr") or "")).strip()
+    if not from_addr:
+        return False, "Set RESEND_FROM (verified sender domain in Resend)"
+    if not to:
+        return False, "No recipients"
+    payload: dict = {
+        "from": from_addr,
+        "to": to,
+        "subject": subject,
+        "text": body,
+    }
+    if attachments:
+        payload["attachments"] = [
+            {
+                "filename": fname or "attachment.bin",
+                "content": base64.b64encode(data).decode("ascii"),
+            }
+            for fname, data, _mime in attachments
+        ]
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        if resp.status not in (200, 201):
+            return False, f"HTTP {resp.status}: {_safe_text(raw, 500)}"
+        return True, ""
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        return False, f"HTTP {e.code}: {_safe_text(detail, 800)}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _deliver_email(
+    cfg: dict,
+    to: list[str],
+    subject: str,
+    body: str,
+    attachments: list[tuple[str, bytes, str]] | None = None,
+) -> tuple[bool, str]:
+    if RESEND_API_KEY:
+        return _send_resend_api(cfg, to, subject, body, attachments=attachments)
+    ok, err = _send_smtp(cfg, to, subject, body, attachments=attachments)
+    if not ok:
+        err = (err or "") + _railway_smtp_blocked_hint(err)
+    return ok, err
+
+
 def _send_smtp(
     cfg: dict,
     to: list[str],
@@ -2671,7 +3525,7 @@ def _send_smtp(
     host = cfg["smtp_host"]
     port = int(cfg.get("smtp_port") or 587)
     user = cfg.get("smtp_user") or ""
-    pw = cfg.get("smtp_password") or ""
+    pw = _normalize_smtp_password(cfg.get("smtp_password") or "")
     use_tls = bool(cfg.get("use_tls", True))
 
     try:
@@ -2706,7 +3560,7 @@ def _send_async(
 ) -> None:
     """Background-thread wrapper around _send_smtp. Logs every attempt."""
     def _worker():
-        ok, err = _send_smtp(cfg, to, subject, body, attachments=attachments)
+        ok, err = _deliver_email(cfg, to, subject, body, attachments=attachments)
         _append_email_log({
             "ts":      now_str(),
             "event":   event,
@@ -2757,7 +3611,7 @@ def send_test_email(cfg: dict, to_addr: str) -> tuple[bool, str]:
         "If you can read this, your SMTP configuration is working.\n\n"
         "—— SUNSHINE 阳光集团 订货系统"
     )
-    ok, err = _send_smtp(cfg, [to_addr], subject, body)
+    ok, err = _deliver_email(cfg, [to_addr], subject, body)
     _append_email_log({
         "ts":      now_str(),
         "event":   "test",
@@ -4652,6 +5506,20 @@ section[data-testid="stMain"] [data-testid="stRadio"] label {
     font-weight: 500 !important;
 }
 
+/* Sidebar nav section — supply chain group */
+.nav-section-head {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #64748b;
+    margin: 0.35rem 0 0.25rem 0;
+    padding: 0.2rem 0.1rem;
+}
+.nav-section-gap {
+    height: 0.35rem;
+}
+
 /* “Current page” strip under sidebar (see _render_active_page_hint) */
 .active-page-hint {
     display: flex;
@@ -4833,6 +5701,97 @@ section[data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.
 .arrival-items-plain li {
     margin-bottom: 0.35rem;
 }
+
+/* =======================================================================
+   电商式购物车悬浮 / 吸底组件 (responsive cart dock)
+   - 容器是 st.container(key="sunshine_cart_dock") → 渲染为 .st-key-sunshine_cart_dock
+   - PC（≥992px）：右上角悬浮卡片，不与左侧蓝色侧边栏冲突
+   - 手机（≤991px）：顶部吸顶横条（左摘要 + 右去结算）
+   ======================================================================= */
+/* 命中购物车 dock 的外层包裹元素：通过其内部"一定会渲染的可见内容"
+   .sunshine-cart-summary 定位（与商品卡片用 .product-card-title 同理）。
+   本页无其它含该内容的 border 包裹祖先，故唯一匹配。 */
+[data-testid="stVerticalBlockBorderWrapper"]:has(.sunshine-cart-summary) {
+    /* !important 必须：覆盖 Streamlit 默认 position，否则退化为随页面滚动。 */
+    position: fixed !important;
+    /* z-index 9999：高于 main 内容，但仍低于 Streamlit 移动端侧栏抽屉遮罩
+       (≈999990)，因此打开蓝色侧边栏时不会被购物车横条盖住，避免层级冲突。 */
+    z-index: 9999 !important;
+    background: #ffffff !important;
+    border: 1px solid #e2e8f0 !important;
+    box-shadow: 0 12px 34px rgba(15, 23, 42, 0.20);
+    /* 数量/金额刷新时的平滑过渡，减少 rerun 后的突兀感 */
+    transition: box-shadow 0.2s ease;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.sunshine-cart-summary) .stButton > button {
+    border-radius: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+.sunshine-cart-summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.15;
+}
+.sunshine-cart-summary .scd-ico { font-size: 1.4rem; }
+.sunshine-cart-summary .scd-count {
+    min-width: 26px;
+    height: 26px;
+    padding: 0 8px;
+    border-radius: 13px;
+    background: #2563eb;
+    color: #fff;
+    font-size: 0.92rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s ease;
+}
+.sunshine-cart-summary .scd-meta {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #475569;
+}
+.sunshine-cart-summary .scd-amount {
+    font-size: 0.95rem;
+    font-weight: 800;
+    color: #0e7a4f;
+}
+
+/* PC（≥992px）：右上角悬浮窗，position:fixed 天然跟随视口滚动 */
+@media (min-width: 992px) {
+    [data-testid="stVerticalBlockBorderWrapper"]:has(.sunshine-cart-summary) {
+        right: 28px !important;
+        top: 16px !important;
+        bottom: auto !important;
+        left: auto !important;
+        width: 320px !important;
+        border-radius: 18px !important;
+        padding: 14px 16px !important;
+    }
+    /* PC 端预留顶部空白：避免右上角悬浮窗压住顶部内容 */
+    section[data-testid="stMain"] .block-container { padding-top: 90px !important; }
+}
+
+/* 手机（≤991px）：吸顶横条，始终锁在屏幕最顶部 */
+@media (max-width: 991px) {
+    [data-testid="stVerticalBlockBorderWrapper"]:has(.sunshine-cart-summary) {
+        left: 0 !important;
+        right: 0 !important;
+        bottom: auto !important;
+        top: 0 !important;
+        width: 100% !important;
+        border-radius: 0 0 16px 16px !important;
+        padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px !important;
+    }
+    [data-testid="stVerticalBlockBorderWrapper"]:has(.sunshine-cart-summary) .stButton > button { width: 100%; }
+    /* 给主内容留出顶部空间，顶部内容不被吸顶横条遮挡 */
+    section[data-testid="stMain"] .block-container { padding-top: 96px !important; }
+}
 </style>
 """
 
@@ -4940,9 +5899,14 @@ def logout_button(key: str = "logout_btn") -> None:
             )
         except Exception:
             pass
+        try:
+            import auth as sunshine_auth
+
+            sunshine_auth.clear_login_cookie()
+        except Exception:
+            pass
         lang = st.session_state.get("lang", "en")
         last_role = st.session_state.get("role")
-        last_branch = st.session_state.get("branch")
         logout_aid = st.session_state.get("account_id")
         logout_br = st.session_state.get("branch")
         if (
@@ -4955,12 +5919,18 @@ def logout_button(key: str = "logout_btn") -> None:
                 _delete_branch_cart_draft(int(logout_aid), str(logout_br).strip())
             except Exception:
                 pass
+        try:
+            if URL_PAGE_QUERY_KEY in st.query_params:
+                del st.query_params[URL_PAGE_QUERY_KEY]
+        except Exception:
+            pass
         st.session_state.clear()
         st.session_state.lang = lang
-        if last_role in (Role.BRANCH, Role.WAREHOUSE, Role.ADMIN):
-            st.session_state.last_role = last_role
-        if last_branch:
-            st.session_state.last_branch = last_branch
+        # 主动退出：勿保留 last_role / URL ?p=，否则登录页像“退回上一屏”，
+        # 且 Cookie+地址栏会恢复到上一业务页。
+        st.session_state._explicit_logout = True
+        st.session_state._sunshine_cookie_bootstrapped = True
+        st.session_state._sunshine_cookie_restore_attempted = True
         st.rerun()
 
 
@@ -4988,6 +5958,7 @@ def init_session() -> None:
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+    # Cookie 自动登录在 route() 开头执行（需先挂载浏览器组件）
 
 
 def _query_param_first(key: str) -> str | None:
@@ -5004,51 +5975,30 @@ def _query_param_first(key: str) -> str | None:
     return s if s else None
 
 
-def _parent_window_history_js(mode: str, page_key: str) -> None:
-    """Update the real browser URL (parent) so the device back key can pop in-app pages."""
-    import json
-
-    m = "push" if mode == "push" else "replace"
-    pk = json.dumps(page_key)
-    mode_j = json.dumps(m)
-    key_q = json.dumps(URL_PAGE_QUERY_KEY)
-    html = f"""
-<script>
-(function() {{
-  try {{
-    var w = window.parent;
-    var p = {pk};
-    var mode = {mode_j};
-    var qk = {key_q};
-    var u = new URL(w.location.href);
-    u.searchParams.set(qk, p);
-    if (mode === "push") {{
-      w.history.pushState({{ sunshine_app: 1, p: p }}, "", u.toString());
-    }} else {{
-      w.history.replaceState({{ sunshine_app: 1, p: p }}, "", u.toString());
-    }}
-    if (!w.__sunshine_popstate_ok) {{
-      w.__sunshine_popstate_ok = true;
-      w.addEventListener("popstate", function () {{
-        w.location.reload();
-      }});
-    }}
-  }} catch (e) {{}}
-}})();
-</script>
-"""
+def _sync_cookie_default_page(page_key: str) -> None:
+    """当前页写入登录 Cookie，F5 时地址栏无 ?p= 也能回到上次页面。"""
+    if not (page_key or "").strip():
+        return
+    if st.session_state.get("_cookie_sync_page") == page_key:
+        return
     try:
-        components.html(html, height=0, width=0)
+        import auth as sunshine_auth
+
+        sunshine_auth.touch_cookie_page(page_key)
+        st.session_state._cookie_sync_page = page_key
     except Exception:
         pass
 
 
 def _apply_url_page_to_session(role: str, allowed: frozenset[str]) -> None:
-    """When the user presses the device back button, URL ?p= changes — honor it."""
+    """地址栏 ?p= 优先（含 F5 刷新、浏览器后退）。"""
     p = _query_param_first(URL_PAGE_QUERY_KEY)
     if not p or p not in allowed:
         return
     if role == Role.BRANCH:
+        if p == "stock":  # 库存/临期页对所有分店账号开放，无需单独授权
+            st.session_state.page = p
+            return
         pmap = {
             "order": "order",
             "order_done": "order",
@@ -5063,29 +6013,42 @@ def _apply_url_page_to_session(role: str, allowed: frozenset[str]) -> None:
     st.session_state.page = p
 
 
-def _sync_browser_history_stack(
-    *,
-    allowed: frozenset[str],
-    current_page: str,
-    nav_from_sidebar: bool,
-) -> None:
-    """Push/replace parent history so back returns to the previous in-app screen."""
-    if current_page not in allowed:
+def _allowed_pages_for_role(role: str) -> frozenset[str]:
+    if role == Role.WAREHOUSE:
+        return WAREHOUSE_PAGE_KEYS
+    if role == Role.ADMIN:
+        return ADMIN_PAGE_KEYS
+    if role == Role.BRANCH:
+        keys: set[str] = set()
+        for page_key, perm in (
+            ("order", "order"),
+            ("my_orders", "my_orders"),
+            ("my_short", "my_short"),
+            ("messages", "messages"),
+            ("ai", "ai"),
+        ):
+            if has_branch_perm(perm):
+                keys.add(page_key)
+        keys.add("order_done")
+        keys.add("stock")  # 库存/临期页对所有分店账号开放
+        return frozenset(keys)
+    return frozenset()
+
+
+def _route_sync_page_from_url() -> None:
+    """Align session page with ?p= when the user uses browser back/forward."""
+    if not is_authenticated():
         return
-    last = st.session_state.get("_hist_last_p")
-    if nav_from_sidebar:
-        if last is None:
-            _parent_window_history_js("replace", current_page)
-        elif last != current_page:
-            _parent_window_history_js("push", current_page)
-        st.session_state._hist_last_p = current_page
+    role = st.session_state.get("role")
+    allowed = _allowed_pages_for_role(role)
+    if not allowed:
         return
-    if last is None:
-        _parent_window_history_js("replace", current_page)
-        st.session_state._hist_last_p = current_page
-        return
-    if last != current_page:
-        st.session_state._hist_last_p = current_page
+    prev = st.session_state.get("page")
+    _apply_url_page_to_session(role, allowed)
+    curr = st.session_state.get("page")
+    if curr != prev and curr in allowed:
+        st.session_state.pop("_nav_from_sidebar", None)
+        st.rerun()
 
 
 def _branch_nav_allowed_keys(nav_items: list[tuple[str, str]]) -> frozenset[str]:
@@ -5106,10 +6069,16 @@ def _set_session_page_for_app_nav(page_key: str) -> None:
 
 WAREHOUSE_PAGE_KEYS = frozenset({
     "pending", "short_in", "history", "supplier", "inventory", "messages", "ai",
+    "supplier_order", "order_success", "verify_inbound", "verify_success",
 })
 ADMIN_PAGE_KEYS = frozenset({
-    "dashboard", "catalog", "shelf_mobile", "accounts", "audit", "inventory",
-    "export", "backup", "messages", "ai",
+    "dashboard", "all_orders", "expiry_dash",
+    "admin_suppliers", "supplier_order", "order_success",
+    "verify_inbound", "verify_success",
+    "images", "catalog", "product_master",
+    "email", "export", "backup",
+    # 仍可通过 URL 直达（未在折叠菜单展示）
+    "shelf_mobile", "accounts", "audit", "inventory", "messages", "ai",
 })
 
 
@@ -5150,6 +6119,8 @@ def branch_perm_label(code: str) -> str:
 
 
 def ensure_branch_page_allowed(page_key: str) -> None:
+    if page_key == "stock":  # 库存/临期页对所有分店账号开放
+        return
     pmap = {
         "order": "order",
         "order_done": "order",
@@ -5225,6 +6196,12 @@ def page_login() -> None:
             st.rerun()
         return
 
+    # 已选角色：进入该角色专属登录页（整页切换，不与角色选择堆叠）。
+    if pending in (Role.BRANCH, Role.WAREHOUSE, Role.ADMIN):
+        _render_role_login_page(pending)
+        return
+
+    # 未选角色：仅显示角色选择页。
     render_header(show_brand_banner=True)
     render_lang_switch()
     render_section_title(t("select_role"))
@@ -5256,8 +6233,35 @@ def page_login() -> None:
         st.session_state.login_branch_context = None
         st.rerun()
 
+
+def _login_back_to_roles_button() -> None:
+    """登录页顶部「返回选择角色」：清掉已选角色，回到角色选择页。"""
+    if st.button(t("back_to_roles"), key="login_back_to_roles"):
+        st.session_state.pop("pending_role", None)
+        st.session_state.last_role = None
+        st.session_state.branch_apply_submitted = False
+        st.session_state.login_branch_context = None
+        st.rerun()
+
+
+def _render_role_login_page(pending: str) -> None:
+    render_header(show_brand_banner=True)
+    render_lang_switch()
+    _login_back_to_roles_button()
+
+    if pending == Role.WAREHOUSE:
+        _password_login(Role.WAREHOUSE, WAREHOUSE_PASSWORD, default_page="pending")
+        return
+    if pending == Role.ADMIN:
+        _password_login(
+            Role.ADMIN,
+            ADMIN_PASSWORD,
+            default_page="dashboard",
+            phone_allowlist=_admin_phone_allowlist(),
+        )
+        return
+
     if pending == Role.BRANCH:
-        st.divider()
         portal = st.session_state.get("login_branch_context")
         if portal not in BRANCHES:
             render_section_title(t("acct_enter_store_title"))
@@ -5307,9 +6311,23 @@ def page_login() -> None:
                         )
                         st.session_state.last_role = Role.BRANCH
                         st.session_state.last_branch = row["branch"]
-                        _set_session_page_for_app_nav(first_allowed_branch_page())
+                        first_pg = first_allowed_branch_page()
+                        _set_session_page_for_app_nav(first_pg)
                         st.session_state.login_branch_context = None
                         st.session_state.pop("pending_role", None)
+                        try:
+                            import auth as sunshine_auth
+
+                            sunshine_auth.persist_login_cookie(
+                                role=Role.BRANCH,
+                                branch=row["branch"],
+                                account_id=int(row["id"]),
+                                account_username=row["username"],
+                                account_perms=st.session_state.account_perms,
+                                default_page=first_pg,
+                            )
+                        except Exception:
+                            pass
                         audit_write(
                             "login",
                             branch=row["branch"],
@@ -5347,17 +6365,6 @@ def page_login() -> None:
                     else:
                         st.error(t(err_k))
 
-    elif pending == Role.WAREHOUSE:
-        _password_login(Role.WAREHOUSE, WAREHOUSE_PASSWORD, default_page="pending")
-
-    elif pending == Role.ADMIN:
-        _password_login(
-            Role.ADMIN,
-            ADMIN_PASSWORD,
-            default_page="dashboard",
-            phone_allowlist=_admin_phone_allowlist(),
-        )
-
 
 def _password_login(
     role: str,
@@ -5391,6 +6398,15 @@ def _password_login(
             st.session_state.last_role = role
             _set_session_page_for_app_nav(default_page)
             st.session_state.pop("pending_role", None)
+            try:
+                import auth as sunshine_auth
+
+                sunshine_auth.persist_login_cookie(
+                    role=role,
+                    default_page=default_page,
+                )
+            except Exception:
+                pass
             extra: dict = {"method": "shared_password", "portal_role": role}
             if need_phone:
                 extra["method"] = "admin_phone_password"
@@ -6046,6 +7062,131 @@ def _render_branch_product_card(row: pd.Series) -> None:
                         )
 
 
+def _enrich_cart_item(item: dict) -> dict:
+    """补全购物车行的状态字段：分店ID + 生产日期（如有）。
+
+    需求要求 cart 数据结构含：商品编号、商品名称、订购箱数、订购个数、
+    分店ID、生产日期。前四者卡片已写入，这里统一补 branch / production_date。
+    """
+    item.setdefault("branch", st.session_state.get("branch", ""))
+    item.setdefault("production_date", item.get("production_date", "") or "")
+    return item
+
+
+def _render_branch_cart_dock() -> None:
+    """电商式购物车悬浮(PC)/吸底(手机)组件：实时摘要 + 去结算。
+
+    用 st.container(key="sunshine_cart_dock") 渲染一个被 CSS 固定定位的容器，
+    里面是真正的 Streamlit 按钮（点击触发 rerun 切换到结算页），
+    因此既有原生交互、又有自定义悬浮布局。
+    """
+    cart = st.session_state.get("cart", [])
+    # 暂存（商品卡片已填、尚未点"追加购物车"）的数量也并入悬浮车统计，
+    # 这样用户边填边能在悬浮车看到实时变化；点"去结算"时再自动并入购物车。
+    pending = _collect_qty_inputs()
+    combined = list(cart) + list(pending)
+
+    count = len(combined)
+    total_ct = sum(int(it.get("qty_cartons", 0) or 0) for it in combined)
+    total_pc = sum(int(it.get("qty_pcs", 0) or 0) for it in combined)
+    total_units = total_ct + total_pc
+    # 预估总金额：单价 × (箱数 + 个数)。手动商品价为 0 不计。
+    total_amount = sum(
+        float(it.get("price", 0) or 0)
+        * (int(it.get("qty_cartons", 0) or 0) + int(it.get("qty_pcs", 0) or 0))
+        for it in combined
+    )
+    amount_html = (
+        f'<span class="scd-amount">💰 {total_amount:,.0f}</span>'
+        if total_amount > 0
+        else ""
+    )
+
+    # 用带边框容器（=stVerticalBlockBorderWrapper），CSS 通过
+    # :has(.sunshine-cart-summary) 命中外层包裹元素并 position:fixed。
+    # 命中点用"一定会渲染的可见内容"，比隐藏空标记 / .st-key- 类名都可靠。
+    with st.container(key="sunshine_cart_dock", border=True):
+        with st.container(
+            horizontal=True,
+            vertical_alignment="center",
+            gap="small",
+        ):
+            st.markdown(
+                '<div class="sunshine-cart-summary">'
+                '<span class="scd-ico">🛒</span>'
+                f'<span class="scd-count">{count}</span>'
+                f'<span class="scd-meta">🧮 {total_units} · 📦 {total_ct} · 🔢 {total_pc}</span>'
+                f"{amount_html}"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                t("cart_checkout"),
+                key="cart_dock_checkout",
+                type="primary",
+                disabled=(count == 0),
+            ):
+                # 先把暂存数量并入购物车，再进结算页，避免漏单。
+                for item in pending:
+                    st.session_state.cart.append(_enrich_cart_item(item))
+                if pending:
+                    _clear_qty_inputs()
+                st.session_state["confirming"] = True
+                st.rerun()
+
+    # --- 终极固定方案：清除祖先的"包含块"属性 --------------------------
+    # position:fixed 若失效（悬浮车随页面滚走而非钉在视口底部），几乎都是
+    # 因为某个祖先元素带了 transform / filter / backdrop-filter / perspective /
+    # will-change:transform / contain 等属性——这些会让 fixed 改为相对该祖先
+    # 定位。CSS 难以预知是哪个祖先，故用 JS 从悬浮车向上遍历到 <body>，
+    # 把这些属性逐个清除（不移动节点，原生按钮交互不受影响）。
+    components.html(
+        """
+<script>
+(function () {
+  const doc = window.parent.document;
+  const win = doc.defaultView;
+  const PROPS = ['transform','filter','backdrop-filter','perspective','contain'];
+  function neutralize() {
+    const sum = doc.querySelector('.sunshine-cart-summary');
+    if (!sum) return;
+    const dock = sum.closest('[data-testid="stVerticalBlockBorderWrapper"]');
+    if (!dock) return;
+    let p = dock.parentElement;
+    while (p && p !== doc.body && p.nodeType === 1) {
+      const s = win.getComputedStyle(p);
+      const wc = s.willChange || '';
+      const needFix =
+        s.transform !== 'none' ||
+        s.filter !== 'none' ||
+        (s.backdropFilter && s.backdropFilter !== 'none') ||
+        s.perspective !== 'none' ||
+        wc.indexOf('transform') !== -1 ||
+        (s.contain && s.contain !== 'none' && s.contain !== 'normal');
+      if (needFix) {
+        p.style.setProperty('transform', 'none', 'important');
+        p.style.setProperty('filter', 'none', 'important');
+        p.style.setProperty('backdrop-filter', 'none', 'important');
+        p.style.setProperty('perspective', 'none', 'important');
+        p.style.setProperty('will-change', 'auto', 'important');
+        p.style.setProperty('contain', 'none', 'important');
+      }
+      p = p.parentElement;
+    }
+  }
+  neutralize();
+  // Streamlit 会不断重渲染 DOM，用 MutationObserver 持续兜底。
+  try {
+    const mo = new MutationObserver(neutralize);
+    mo.observe(doc.body, { childList: true, subtree: true });
+  } catch (e) {}
+})();
+</script>
+        """,
+        height=0,
+    )
+
+
 # ----- Mode 1: browse / search / fill quantities --------------------------
 def _branch_order_browse() -> None:
     render_page_heading(f"🛒 {t('nav_order')}")
@@ -6127,9 +7268,10 @@ def _branch_order_browse() -> None:
             with c1: mct = st.number_input(t("cartons"), min_value=0, value=0, step=1)
             with c2: mpc = st.number_input(t("each_pcs"), min_value=0, value=0, step=1)
             with c3: mbar = st.text_input(t("barcode"))
+            mprod = st.text_input(t("prod_date_opt"), placeholder="YYYY-MM-DD")
             if st.form_submit_button(t("add_to_cart"), type="primary"):
                 if mname.strip() and (mct > 0 or mpc > 0):
-                    st.session_state.cart.append({
+                    st.session_state.cart.append(_enrich_cart_item({
                         "item_code": "",
                         "barcode":   mbar.strip(),
                         "name":      mname.strip(),
@@ -6138,7 +7280,8 @@ def _branch_order_browse() -> None:
                         "qty_cartons": int(mct),
                         "qty_pcs":     int(mpc),
                         "is_manual": 1,
-                    })
+                        "production_date": (mprod or "").strip(),
+                    }))
                     st.success(f"✓ {mname}")
                     st.rerun()
 
@@ -6172,19 +7315,16 @@ def _branch_order_browse() -> None:
             st.warning(t("no_qty_selected"))
         else:
             for item in selected:
-                st.session_state.cart.append(item)
+                st.session_state.cart.append(_enrich_cart_item(item))
             _clear_qty_inputs()
             st.success(t("added_n_items").format(n=n_selected))
             st.rerun()
 
-    # Secondary action: go to confirm page (only if cart non-empty)
-    if cart_count > 0:
-        if st.button(t("review_cart"), use_container_width=True,
-                     key="go_review"):
-            st.session_state["confirming"] = True
-            st.rerun()
-    else:
-        st.info(t("empty_cart"))
+    # 注：原先这里还有一个「去结算 / 购物车为空」按钮，与底部悬浮车的
+    # 「去结算」功能重复，已移除，统一由悬浮车负责结算入口。
+
+    # 电商式悬浮/吸底购物车（始终渲染，空车时按钮禁用）。
+    _render_branch_cart_dock()
 
 
 # ----- Mode 2: review cart, edit, then send -------------------------------
@@ -6213,6 +7353,8 @@ def _branch_order_confirm() -> None:
                 if item["item_code"]: sub.append(f"📋 {item['item_code']}")
                 if item["barcode"]:   sub.append(f"📊 {item['barcode']}")
                 if item["unit"]:      sub.append(f"📦 {item['unit']}")
+                if item.get("production_date"):
+                    sub.append(f"🗓️ {item['production_date']}")
                 if sub:
                     st.caption(" · ".join(sub))
             with top2:
@@ -6946,23 +8088,33 @@ def page_warehouse_pending() -> None:
                                     stamp = now_str()
                                     with db_conn() as conn:
                                         insufficient: list[str] = []
+                                        # 防跨行超卖：同一商品若出现在多行，按"累计需求"对
+                                        # 可用库存做递减校验；无库存记录的商品按 0 计，
+                                        # 任何正向发货都会被拦截（避免发出不存在的库存）。
+                                        avail: dict[str, list[int]] = {}
                                         for _, row in group.iterrows():
                                             line_id = int(row["id"])
                                             dc, dp = dispatch_inputs.get(line_id, (0, 0))
-                                            inv_row = _get_inventory_row(
-                                                conn,
-                                                str(row.get("item_code", "") or ""),
-                                                str(row.get("barcode", "") or ""),
-                                                str(row.get("name", "") or ""),
-                                            )
-                                            if inv_row is None:
+                                            if int(dc) == 0 and int(dp) == 0:
                                                 continue
-                                            has_ct = int(inv_row["stock_cartons"] or 0)
-                                            has_pc = int(inv_row["stock_pcs"] or 0)
-                                            if int(dc) > has_ct or int(dp) > has_pc:
+                                            ic = str(row.get("item_code", "") or "")
+                                            bc = str(row.get("barcode", "") or "")
+                                            nm = str(row.get("name", "") or "")
+                                            key = _inventory_item_key(ic, bc, nm)
+                                            if key not in avail:
+                                                inv_row = _get_inventory_row(conn, ic, bc, nm)
+                                                avail[key] = [
+                                                    int(inv_row["stock_cartons"] or 0) if inv_row else 0,
+                                                    int(inv_row["stock_pcs"] or 0) if inv_row else 0,
+                                                ]
+                                            rem_ct, rem_pc = avail[key]
+                                            if int(dc) > rem_ct or int(dp) > rem_pc:
                                                 insufficient.append(
-                                                    f"{row['name']} (库存 {has_ct}/{has_pc}, 发货 {int(dc)}/{int(dp)})"
+                                                    f"{nm} (剩余 {rem_ct}/{rem_pc}, 发货 {int(dc)}/{int(dp)})"
                                                 )
+                                            else:
+                                                avail[key][0] = rem_ct - int(dc)
+                                                avail[key][1] = rem_pc - int(dp)
                                         if insufficient:
                                             rows = []
                                         else:
@@ -8863,6 +10015,10 @@ def page_admin_email() -> None:
     """Configure SMTP, per-event recipients, and test sending."""
     render_page_heading(f"📧 {t('email_title')}")
     st.caption(t("email_subtitle"))
+    if RESEND_API_KEY:
+        st.success(t("email_resend_active"))
+    elif os.getenv("RAILWAY_ENVIRONMENT_NAME", "").strip():
+        st.warning(t("email_railway_smtp_hint"))
 
     cfg = load_email_config()
 
@@ -9796,6 +10952,24 @@ def page_admin_messages_center() -> None:
 # =========================================================================
 # WORKSPACE ROUTERS
 # =========================================================================
+def _render_sidebar_nav_sections(
+    sections: list[tuple[str | None, list[tuple[str, str]]]],
+) -> list[tuple[str, str]]:
+    """分组侧栏导航；返回扁平列表供当前页提示条使用。"""
+    flat: list[tuple[str, str]] = []
+    for title, items in sections:
+        if title:
+            st.sidebar.markdown(
+                f'<div class="nav-section-head">{html.escape(title)}</div>',
+                unsafe_allow_html=True,
+            )
+        _render_sidebar_nav(items)
+        flat.extend(items)
+        if title:
+            st.sidebar.markdown('<div class="nav-section-gap"></div>', unsafe_allow_html=True)
+    return flat
+
+
 def _render_sidebar_nav(items: list[tuple[str, str]]) -> None:
     for page_key, label in items:
         is_active = st.session_state.page == page_key
@@ -9809,6 +10983,12 @@ def _render_sidebar_nav(items: list[tuple[str, str]]) -> None:
             st.session_state._nav_from_sidebar = True
             try:
                 st.query_params[URL_PAGE_QUERY_KEY] = page_key
+            except Exception:
+                pass
+            try:
+                import auth as sunshine_auth
+
+                sunshine_auth.touch_cookie_page(page_key)
             except Exception:
                 pass
             # Leaving any page should drop the order-confirm modal state.
@@ -9832,6 +11012,11 @@ def _page_theme_color(page_key: str) -> str:
         "short_in": "#c62828",
         "history": "#455a64",
         "supplier": "#00695c",
+        "supplier_order": "#00695c",
+        "verify_inbound": "#00838f",
+        "admin_suppliers": "#004d40",
+        "order_success": "#2e7d32",
+        "verify_success": "#2e7d32",
         "dashboard": "#3949ab",
         "shelf_mobile": "#00695c",
         "accounts": "#5e35b1",
@@ -9845,6 +11030,7 @@ def _page_theme_color(page_key: str) -> str:
         "images": "#8e24aa",
         "backup": "#6d4c41",
         "email": "#7b1fa2",
+        "product_master": "#1565c0",
         "messages": "#1976d2",
         "ai": "#283593",
     }
@@ -9864,6 +11050,231 @@ def _render_active_page_hint(items: list[tuple[str, str]]) -> None:
         f'<span class="active-page-hint__v">{html.escape(label)}</span></div>',
         unsafe_allow_html=True,
     )
+
+
+def _stock_fill_from_product_row(mrow) -> None:
+    """把商品库一行写入入库表单的 session 字段，并标记为"已锁定"。"""
+    st.session_state["stk_name"] = str(mrow.get("Name", "") or "")
+    st.session_state["stk_code"] = str(
+        mrow.get("ItemCode") or mrow.get("Barcode") or ""
+    ).strip()
+    st.session_state["stk_unit"] = str(mrow.get("Unit", "") or "")
+    st.session_state["_stk_locked"] = True
+
+
+def _stock_series_col(df: pd.DataFrame, col: str) -> pd.Series:
+    """安全取列并规整为去空白字符串 Series（列缺失时返回空串）。"""
+    if col in df.columns:
+        return df[col].fillna("").astype(str).str.strip()
+    return pd.Series([""] * len(df), index=df.index)
+
+
+def _on_stock_search_enter() -> None:
+    """搜索框回车 / 扫码枪录入：若能唯一精确匹配编号或条码，直接填入并清空搜索框，
+    实现"扫一个填一个"的流式录入。回调在 rerun 前执行，故可安全改写控件 session。"""
+    q = (st.session_state.get("stock_pick_q") or "").strip()
+    if not q:
+        return
+    df = search_products(q, limit=50)
+    if df is None or df.empty:
+        return
+    bc = _stock_series_col(df, "Barcode")
+    ic = _stock_series_col(df, "ItemCode")
+    exact = df[(bc == q) | (ic == q)]
+    row = None
+    if len(exact) == 1:
+        row = exact.iloc[0]
+    elif len(df) == 1:
+        row = df.iloc[0]
+    if row is not None:
+        _stock_fill_from_product_row(row)
+        # 清空搜索/下拉，准备下一次扫码
+        st.session_state["stock_pick_q"] = ""
+        st.session_state["stock_pick_sel"] = "—"
+
+
+def _reset_stock_pick() -> None:
+    """复位入库表单：清空锁定与所有相关字段（用 on_click 回调，在控件重建前执行，
+    因此可安全删除 widget 的 session key，避免"实例化后修改"报错）。"""
+    for k in ("stk_name", "stk_code", "stk_unit",
+              "stock_pick_q", "stock_pick_sel"):
+        st.session_state.pop(k, None)
+    st.session_state["_stk_locked"] = False
+
+
+def _on_stock_select() -> None:
+    """下拉选择即填入（取消"填入表单"中转按钮）。"""
+    label = st.session_state.get("stock_pick_sel", "")
+    mp = st.session_state.get("_stk_opt_map", {})
+    if label and label != "—" and label in mp:
+        d = mp[label]
+        st.session_state["stk_name"] = d["name"]
+        st.session_state["stk_code"] = d["code"]
+        st.session_state["stk_unit"] = d["unit"]
+        st.session_state["_stk_locked"] = True
+
+
+def page_branch_stock() -> None:
+    """分店库存/临期页：录入批次（入库）+ 查看本店当前批次与临期/过期提醒。"""
+    branch = st.session_state.get("branch") or ""
+    render_page_heading(t("nav_stock"), t("stock_subtitle"))
+    warn_days = expiry_warn_days()
+
+    # ---- 商品来源：即搜即填 / 扫码即填（搜索器在 st.form 之外）----
+    # 表单内控件提交前不会 rerun，无法联动；故搜索 + 选择放在表单外，
+    # 通过 on_change 回调把选中商品写入表单字段的 session key。
+    st.markdown(f"#### {t('stock_pick_title')}")
+    st.text_input(
+        t("stock_pick_ph"), key="stock_pick_q",
+        placeholder=t("stock_pick_ph"),
+        help="支持扫码枪：扫码后回车自动匹配并填入 / Scanner: scan + Enter to auto-fill",
+        on_change=_on_stock_search_enter,
+    )
+    pick_q = (st.session_state.get("stock_pick_q") or "").strip()
+    if pick_q:
+        matches = search_products(pick_q, limit=50)
+        if matches is not None and not matches.empty:
+            options = ["—"]
+            opt_map: dict[str, dict] = {}
+            for _, mrow in matches.iterrows():
+                code_disp = str(mrow.get("ItemCode") or mrow.get("Barcode") or "").strip()
+                label = f"{mrow.get('Name', '')}" + (f"｜{code_disp}" if code_disp else "")
+                if label in opt_map:                      # 避免重复标签互相覆盖
+                    label = f"{label} #{len(opt_map)}"
+                options.append(label)
+                opt_map[label] = {
+                    "name": str(mrow.get("Name", "") or ""),
+                    "code": code_disp,
+                    "unit": str(mrow.get("Unit", "") or ""),
+                }
+            st.session_state["_stk_opt_map"] = opt_map   # 供 on_change 回调取用
+            # 选择即填入：on_change 回调直接写 session，无需中转按钮
+            st.selectbox(
+                t("stock_pick_select"), options,
+                key="stock_pick_sel",
+                on_change=_on_stock_select,
+            )
+        else:
+            st.caption(t("no_results"))
+
+    locked = bool(st.session_state.get("_stk_locked", False))
+    if locked:
+        lc1, lc2 = st.columns([3, 1])
+        lc1.success(f"✓ {st.session_state.get('stk_name', '')}")
+        # 用 on_click 回调复位，避免在主流程里改写已实例化的 widget key
+        lc2.button(t("stock_pick_clear"), key="stk_clear",
+                   on_click=_reset_stock_pick, use_container_width=True)
+
+    # ---- 入库表单（核心：必须填过期日期）----
+    with st.form("branch_stock_add", clear_on_submit=True):
+        st.markdown(f"#### {t('stock_add_title')}")
+        if locked:
+            st.caption(f"✅ {t('stock_locked_hint')}")
+        # 注意：表单内 disabled 控件提交时不回传值（同 HTML 原生行为），
+        # 会导致校验"商品名称为空"而无法保存。故这里保持可编辑（自动带入，
+        # 允许微调），既消除该 Bug，又满足"自动填充 + 可微调"。
+        name = st.text_input(t("stock_name"), key="stk_name")
+        c1, c2 = st.columns(2)
+        code = c1.text_input(t("stock_code"), key="stk_code")
+        unit = c2.text_input(t("stock_unit"), key="stk_unit")
+        c3, c4, c5 = st.columns(3)
+        qty_ct = c3.number_input(t("stock_qty_ct"), min_value=0, step=1, value=0)
+        qty_pc = c4.number_input(t("stock_qty_pc"), min_value=0, step=1, value=0)
+        # 过期日期默认留空，等待店员录入（避免误用默认值）。
+        expire = c5.date_input(t("stock_expire"), value=None, format="YYYY-MM-DD")
+        batch_no = st.text_input(t("stock_batch_no"))
+        submitted = st.form_submit_button(
+            t("stock_add_btn"), type="primary", use_container_width=True
+        )
+    if submitted:
+        if expire is None:
+            st.error(t("stock_need_expire"))
+        elif int(qty_ct) <= 0 and int(qty_pc) <= 0:
+            st.error(t("stock_need_qty"))
+        elif not (name or "").strip():
+            st.error(t("stock_name"))
+        else:
+            # 编号若为 8 位以上纯数字按条码处理，否则当作商品编号。
+            code_s = (code or "").strip()
+            is_barcode = code_s.isdigit() and len(code_s) >= 8
+            try:
+                add_branch_batch(
+                    branch=branch,
+                    name=name,
+                    item_code="" if is_barcode else code_s,
+                    barcode=code_s if is_barcode else "",
+                    unit=unit,
+                    qty_cartons=int(qty_ct),
+                    qty_pcs=int(qty_pc),
+                    expire_date=expire.strftime("%Y-%m-%d"),
+                    batch_no=batch_no,
+                    received_by=st.session_state.get("account_username") or "",
+                )
+                # 复位锁定，准备下一条录入（_stk_locked 非 widget key，安全；
+                # 表单字段由 clear_on_submit 自动清空）。
+                st.session_state["_stk_locked"] = False
+                st.success(t("stock_add_ok"))
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+    st.divider()
+
+    # ---- 当前批次 + 临期提醒 ----
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM branch_inventory_batches
+            WHERE branch = ? AND status = 'active'
+              AND (qty_cartons > 0 OR qty_pcs > 0)
+            ORDER BY expire_date ASC
+            """,
+            (branch,),
+        ).fetchall()
+
+    if not rows:
+        st.info(t("stock_none"))
+        return
+
+    today = datetime.now().date()
+
+    def _days_left(r) -> int | None:
+        exp = _parse_ymd(r["expire_date"])
+        return (exp.date() - today).days if exp else None
+
+    # 临期/过期高亮（<= 预警天数 或 已过期）
+    warn_rows = [r for r in rows if (_days_left(r) is not None and _days_left(r) <= warn_days)]
+    if warn_rows:
+        lines = []
+        for r in warn_rows:
+            dl = _days_left(r)
+            tag = t("stock_expired") if dl < 0 else f"{dl} {t('stock_days_left')}"
+            lines.append(f"- **{r['name']}** · {r['expire_date']} · {tag}")
+        st.warning(f"#### ⚠️ {t('stock_warn_title')}\n" + "\n".join(lines))
+
+    st.markdown(f"#### {t('stock_list_title')}")
+    table = []
+    for r in rows:
+        dl = _days_left(r)
+        if dl is None:
+            status_txt = ""
+        elif dl < 0:
+            status_txt = t("stock_expired")
+        else:
+            status_txt = f"{dl} {t('stock_days_left')}"
+        qty = []
+        if int(r["qty_cartons"] or 0) > 0:
+            qty.append(f"{int(r['qty_cartons'])} {t('stock_qty_ct')}")
+        if int(r["qty_pcs"] or 0) > 0:
+            qty.append(f"{int(r['qty_pcs'])} {t('stock_qty_pc')}")
+        table.append({
+            t("stock_name"): r["name"],
+            t("stock_code"): (r["item_code"] or r["barcode"] or ""),
+            t("stock_qty_ct"): " / ".join(qty),
+            t("stock_expire"): r["expire_date"],
+            t("stock_warn_title"): status_txt,
+        })
+    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
 
 
 def render_branch() -> None:
@@ -9893,18 +11304,13 @@ def render_branch() -> None:
         logout_button("logout_branch_noperm")
         return
 
+    # 库存/临期页对所有分店账号开放（不依赖逐个授权）。
+    nav_items.append(("stock", t("nav_stock")))
+
     allowed = _branch_nav_allowed_keys(nav_items)
-    nav_from_sidebar = st.session_state.pop("_nav_from_sidebar", False)
-    if not nav_from_sidebar:
-        _apply_url_page_to_session(Role.BRANCH, allowed)
+    _apply_url_page_to_session(Role.BRANCH, allowed)
 
     ensure_branch_page_allowed(st.session_state.get("page") or nav_items[0][0])
-
-    _sync_browser_history_stack(
-        allowed=allowed,
-        current_page=st.session_state.page,
-        nav_from_sidebar=nav_from_sidebar,
-    )
 
     _hydrate_branch_cart_if_needed()
 
@@ -9921,41 +11327,66 @@ def render_branch() -> None:
         "my_short":  page_branch_shortages,
         "messages":  page_messages,
         "ai":        page_ai_assistant,
+        "stock":     page_branch_stock,
     }
     pages.get(st.session_state.page, page_branch_order)()
+    _sync_cookie_default_page(st.session_state.page)
     _persist_branch_cart()
 
 
+def _sc_apply_inventory_receive(
+    *,
+    item_code: str,
+    barcode: str,
+    name: str,
+    unit: str,
+    change_ct: int,
+    change_pc: int,
+    order_id: str,
+    operator: str,
+) -> tuple[int, int]:
+    with db_conn() as conn:
+        return _apply_inventory_change(
+            conn,
+            "PURCHASE_RECEIVE",
+            item_code,
+            barcode,
+            name,
+            unit,
+            change_ct,
+            change_pc,
+            order_id=order_id,
+            operator=operator,
+        )
+
+
 def render_warehouse() -> None:
+    import main as supply_main
+
     render_sidebar_lang_switch()
 
     st.sidebar.markdown(f"**{t('role_warehouse')}**")
     st.sidebar.divider()
-    nav_items = [
-        ("pending",  t("nav_pending")),
-        ("short_in", t("nav_short_in")),
-        ("history",  t("nav_dispatch_history")),
-        ("supplier", t("nav_supplier_order")),
-        ("inventory", t("nav_inventory")),
-        ("messages", _nav_messages_label()),
-        ("ai",       t("nav_ai")),
-    ]
-    nav_from_sidebar = st.session_state.pop("_nav_from_sidebar", False)
-    if not nav_from_sidebar:
-        _apply_url_page_to_session(Role.WAREHOUSE, WAREHOUSE_PAGE_KEYS)
+    _apply_url_page_to_session(Role.WAREHOUSE, WAREHOUSE_PAGE_KEYS)
     if (st.session_state.get("page") or "") not in WAREHOUSE_PAGE_KEYS:
         st.session_state.page = "pending"
-    _sync_browser_history_stack(
-        allowed=WAREHOUSE_PAGE_KEYS,
-        current_page=st.session_state.page,
-        nav_from_sidebar=nav_from_sidebar,
+    nav_items = supply_main.render_role_sidebar(
+        Role.WAREHOUSE, messages_label=_nav_messages_label(),
     )
-    _render_sidebar_nav(nav_items)
     st.sidebar.divider()
     with st.sidebar:
         logout_button("logout_warehouse")
     _render_active_page_hint(nav_items)
 
+    page_key = st.session_state.page or "pending"
+    if supply_main.dispatch_supply_chain_page(
+        page_key,
+        render_page_heading=render_page_heading,
+        search_products=search_products,
+        apply_inventory_receive=_sc_apply_inventory_receive,
+        audit_write=audit_write,
+    ):
+        return
     pages = {
         "pending":  page_warehouse_pending,
         "short_in": page_warehouse_shortages,
@@ -9965,61 +11396,69 @@ def render_warehouse() -> None:
         "messages": page_messages,
         "ai":       page_ai_assistant,
     }
-    pages.get(st.session_state.page, page_warehouse_pending)()
+    pages.get(page_key, page_warehouse_pending)()
+    _sync_cookie_default_page(page_key)
 
 
 def render_admin() -> None:
+    import main as supply_main
+
     render_sidebar_lang_switch()
 
     st.sidebar.markdown(f"**{t('role_admin')}**")
     st.sidebar.divider()
-    nav_items = [
-        ("dashboard",  t("nav_dashboard")),
-        ("catalog",    "📋 商品主档" if st.session_state.get("lang") == "zh" else "📋 Catalog"),
-        ("shelf_mobile", t("nav_shelf_mobile")),
-        ("accounts",   t("nav_accounts")),
-        ("audit",      t("nav_audit_log")),
-        ("inventory",  t("nav_inventory")),
-        ("export",     t("nav_export")),
-        ("backup",     t("nav_backup")),
-        ("messages",   _nav_messages_label()),
-        ("ai",         t("nav_ai")),
-    ]
-    nav_from_sidebar = st.session_state.pop("_nav_from_sidebar", False)
-    if not nav_from_sidebar:
-        _apply_url_page_to_session(Role.ADMIN, ADMIN_PAGE_KEYS)
+    _apply_url_page_to_session(Role.ADMIN, ADMIN_PAGE_KEYS)
     if (st.session_state.get("page") or "") not in ADMIN_PAGE_KEYS:
         st.session_state.page = "dashboard"
-    _sync_browser_history_stack(
-        allowed=ADMIN_PAGE_KEYS,
-        current_page=st.session_state.page,
-        nav_from_sidebar=nav_from_sidebar,
+    nav_items = supply_main.render_role_sidebar(
+        Role.ADMIN, messages_label=_nav_messages_label(),
     )
-    _render_sidebar_nav(nav_items)
     st.sidebar.divider()
     with st.sidebar:
         logout_button("logout_admin")
     _render_active_page_hint(nav_items)
 
+    page_key = st.session_state.page or "dashboard"
+    if supply_main.dispatch_supply_chain_page(
+        page_key,
+        render_page_heading=render_page_heading,
+        search_products=search_products,
+        apply_inventory_receive=_sc_apply_inventory_receive,
+        audit_write=audit_write,
+    ):
+        return
     pages = {
         "dashboard":  page_admin_dashboard,
+        "all_orders": page_admin_all_orders,
+        "expiry_dash": page_admin_expiry_dashboard,
         "catalog":    page_admin_product_catalog,
+        "product_master": page_admin_product_catalog,
         "shelf_mobile": page_admin_shelf_mobile,
         "accounts":   page_admin_accounts,
         "audit":      page_admin_audit_log,
         "inventory":  page_admin_inventory,
+        "images":     page_admin_images,
+        "email":      page_admin_email,
         "export":     page_admin_export,
         "backup":     page_admin_backup,
         "messages":   page_admin_messages_center,
         "ai":         page_ai_assistant,
     }
-    pages.get(st.session_state.page, page_admin_dashboard)()
+    pages.get(page_key, page_admin_dashboard)()
+    _sync_cookie_default_page(page_key)
 
 
 # =========================================================================
 # ROUTER
 # =========================================================================
 def route() -> None:
+    try:
+        import auth as sunshine_auth
+
+        sunshine_auth.prepare_auth_from_cookie()
+    except Exception:
+        pass
+
     nav = None
     try:
         nav = st.query_params.get("nav")
@@ -10045,6 +11484,7 @@ def route() -> None:
     if not is_authenticated():
         page_login()
         return
+    _route_sync_page_from_url()
     role = st.session_state.role
     if role == Role.BRANCH:
         render_branch()

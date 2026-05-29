@@ -1,4 +1,5 @@
 gemini.env
+email_config.json
 __pycache__/
 *.pyc
 orders.db
@@ -6,3 +7,7 @@ backups/*.db
 app_runtime.log
 email_log.json
 ~$products.xlsx
+
+# Android (Capacitor) wrapper — 与 Railway 网页部署无关，且含大量依赖/构建产物
+sunshine-android/
+product_images/新建文件夹/
