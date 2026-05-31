@@ -20,6 +20,7 @@ import smtplib
 import sqlite3
 import ssl
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -11498,6 +11499,164 @@ def route() -> None:
 
 
 # =========================================================================
+# FIRST-LOAD SPLASH · 品牌化动态加载页
+# =========================================================================
+# 全屏覆盖层：科技蓝微渐变 + 毛玻璃 + 双环旋转 + 品牌文字 + 进度条流光。
+# 用 position:fixed 覆盖整个视口，盖住 Streamlit 默认的灰色骨架屏。
+# 仅在每个会话「首次进入 / 刷新页面」时出现一次（由 _app_warmed 守卫），
+# 页面内切菜单、加减购物车等 rerun 不会再触发，保证操作流畅不被打断。
+LOADING_SPLASH_HTML = """
+<style>
+@keyframes sunsp-spin   { to { transform: rotate(360deg); } }
+@keyframes sunsp-pulse  { 0%,100% { transform: scale(.92); opacity:.6; }
+                          50%      { transform: scale(1.08); opacity:1; } }
+@keyframes sunsp-fade   { from { opacity: 0; } to { opacity: 1; } }
+@keyframes sunsp-bar    { 0% { left: -45%; } 100% { left: 100%; } }
+@keyframes sunsp-float  { 0%,100% { transform: translateY(0); }
+                          50%      { transform: translateY(-6px); } }
+
+#sunshine-splash {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483646;            /* 盖住一切（含侧栏/骨架屏） */
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 22px;
+    text-align: center;
+    color: #eaf2ff;
+    font-family: "Segoe UI", system-ui, -apple-system, "PingFang SC",
+                 "Microsoft YaHei", sans-serif;
+    background:
+        radial-gradient(1100px 560px at 50% -12%, rgba(64,140,255,.30), transparent 60%),
+        radial-gradient(800px 460px at 88% 110%, rgba(255,196,84,.16), transparent 55%),
+        linear-gradient(135deg, #081a3c 0%, #0c2a63 46%, #11409a 100%);
+    -webkit-backdrop-filter: blur(16px) saturate(165%);
+    backdrop-filter: blur(16px) saturate(165%);
+    animation: sunsp-fade .35s ease both;
+}
+#sunshine-splash .sunsp-ring-wrap {
+    position: relative;
+    width: 124px;
+    height: 124px;
+    animation: sunsp-float 3s ease-in-out infinite;
+}
+#sunshine-splash .sunsp-ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 4px solid rgba(255,255,255,.10);
+    border-top-color: #5aa6ff;
+    border-right-color: #9cc8ff;
+    box-shadow: 0 0 34px rgba(90,166,255,.45);
+    animation: sunsp-spin 1.05s linear infinite;
+}
+#sunshine-splash .sunsp-ring.inner {
+    inset: 17px;
+    border-width: 3px;
+    border-top-color: #ffd36b;
+    border-right-color: transparent;
+    border-bottom-color: rgba(255,211,107,.35);
+    box-shadow: none;
+    animation: sunsp-spin 1.6s linear infinite reverse;
+}
+#sunshine-splash .sunsp-emoji {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2.5rem;
+    animation: sunsp-pulse 1.7s ease-in-out infinite;
+}
+#sunshine-splash .sunsp-title {
+    font-size: 1.4rem;
+    font-weight: 800;
+    letter-spacing: .4px;
+    background: linear-gradient(90deg, #ffffff 0%, #bcd8ff 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+}
+#sunshine-splash .sunsp-sub {
+    font-size: .94rem;
+    font-weight: 500;
+    color: #aecbf3;
+    max-width: 80vw;
+}
+#sunshine-splash .sunsp-sub-en {
+    font-size: .8rem;
+    color: #7e9fd0;
+    margin-top: -8px;
+}
+#sunshine-splash .sunsp-progress {
+    position: relative;
+    width: 260px;
+    max-width: 70vw;
+    height: 4px;
+    border-radius: 99px;
+    background: rgba(255,255,255,.12);
+    overflow: hidden;
+}
+#sunshine-splash .sunsp-progress::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -45%;
+    width: 45%;
+    height: 100%;
+    border-radius: 99px;
+    background: linear-gradient(90deg, transparent, #5aa6ff, #9cc8ff, transparent);
+    animation: sunsp-bar 1.15s ease-in-out infinite;
+}
+</style>
+<div id="sunshine-splash">
+    <div class="sunsp-ring-wrap">
+        <div class="sunsp-ring"></div>
+        <div class="sunsp-ring inner"></div>
+        <div class="sunsp-emoji">🛒</div>
+    </div>
+    <div class="sunsp-title">☀️ SUNSHINE 订货系统正在初始化…</div>
+    <div class="sunsp-sub">正在为您同步各分店实时库存，请稍候…</div>
+    <div class="sunsp-sub-en">Syncing live inventory across stores · please wait</div>
+    <div class="sunsp-progress"></div>
+</div>
+"""
+
+
+def _warm_app_caches() -> None:
+    """首屏一次性预热重型缓存（商品主档）。
+
+    load_products 带 @st.cache_data，首次调用真正读库/读表（较慢），
+    之后命中缓存几乎瞬时——这样炫酷加载页只会在首次进入时出现。"""
+    try:
+        load_products(_products_mtime(), _inventory_version(), _price_version())
+    except Exception as e:
+        log_exception("warm_app_caches", e)
+
+
+def maybe_run_first_load_splash() -> None:
+    """仅在每个会话首次进入 / 刷新页面时，显示一次品牌加载页并预热缓存。
+
+    用 st.empty() 占位渲染全屏覆盖层，预热完成后调用 .empty() 移除，
+    随后正常渲染页面内容，形成「加载中 → 加载完成」的平滑过渡。
+    """
+    if st.session_state.get("_app_warmed"):
+        return
+    splash = st.empty()
+    splash.markdown(LOADING_SPLASH_HTML, unsafe_allow_html=True)
+    started = time.monotonic()
+    _warm_app_caches()
+    # 保证动画至少完整呈现 ~0.6s，避免缓存极快命中时「一闪而过」。
+    remaining = 0.6 - (time.monotonic() - started)
+    if remaining > 0:
+        time.sleep(remaining)
+    st.session_state["_app_warmed"] = True
+    splash.empty()
+
+
+# =========================================================================
 # ENTRY
 # =========================================================================
 def main() -> None:
@@ -11510,6 +11669,10 @@ def main() -> None:
     inject_css()
     init_db()
     init_session()
+
+    # 首屏品牌化加载页：仅本会话首次进入/刷新时出现一次，并预热商品主档缓存。
+    # 之后的菜单切换、加减购物车等 rerun 都会命中缓存、跳过此动画，操作流畅。
+    maybe_run_first_load_splash()
 
     # Take a one-time backup snapshot per Streamlit process so even if a
     # code change later corrupts the DB, we have a "fresh process start"
