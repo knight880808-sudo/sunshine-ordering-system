@@ -5907,19 +5907,10 @@ def logout_button(key: str = "logout_btn") -> None:
         except Exception:
             pass
         lang = st.session_state.get("lang", "en")
-        last_role = st.session_state.get("role")
-        logout_aid = st.session_state.get("account_id")
-        logout_br = st.session_state.get("branch")
-        if (
-            last_role == Role.BRANCH
-            and logout_aid is not None
-            and logout_br
-            and str(logout_br).strip()
-        ):
-            try:
-                _delete_branch_cart_draft(int(logout_aid), str(logout_br).strip())
-            except Exception:
-                pass
+        # 注意：登出时【不再】删除购物车草稿。选好的商品要一直保留，
+        # 跨登出/登录、不限时间，直到真正「发送订单」才清空（见 page_branch_cart
+        # 发送成功后 cart=[] 并持久化为空草稿）。草稿按 (account_id, branch) 隔离，
+        # 不会泄漏给其他账号，故安全保留。
         try:
             if URL_PAGE_QUERY_KEY in st.query_params:
                 del st.query_params[URL_PAGE_QUERY_KEY]
@@ -6120,11 +6111,12 @@ def branch_perm_label(code: str) -> str:
 
 
 def ensure_branch_page_allowed(page_key: str) -> None:
-    if page_key == "stock":  # 库存/临期页对所有分店账号开放
+    if page_key in ("stock", "more"):  # 库存/临期与「更多」页对所有分店账号开放
         return
     pmap = {
         "order": "order",
         "order_done": "order",
+        "cart": "order",
         "my_orders": "my_orders",
         "my_short": "my_short",
         "messages": "messages",
@@ -6832,16 +6824,11 @@ def page_admin_arrivals() -> None:
 # BRANCH PAGES
 # =========================================================================
 def page_branch_order() -> None:
-    """Branch staff order placement.
+    """Branch staff order placement: 浏览/搜索/填数量/追加购物车。
 
-    Two modes, switched by st.session_state.confirming:
-      False (default) → browse / search / fill quantities / batch-add → cart
-      True            → review cart, edit quantities, send to DB
+    购物车的查看与结算已独立成 page_branch_cart（page key = "cart"）。
     """
-    if st.session_state.get("confirming"):
-        _branch_order_confirm()
-    else:
-        _branch_order_browse()
+    _branch_order_browse()
 
 
 # ----- Helpers ------------------------------------------------------------
@@ -7127,13 +7114,8 @@ def _render_branch_cart_dock() -> None:
                 type="primary",
                 disabled=(count == 0),
             ):
-                # 先把暂存数量并入购物车，再进结算页，避免漏单。
-                for item in pending:
-                    st.session_state.cart.append(_enrich_cart_item(item))
-                if pending:
-                    _clear_qty_inputs()
-                st.session_state["confirming"] = True
-                st.rerun()
+                # 进入独立购物车页（_go_branch_cart 内部会把暂存数量并入购物车）。
+                _go_branch_cart()
 
     # --- 终极固定方案：清除祖先的"包含块"属性 --------------------------
     # position:fixed 若失效（悬浮车随页面滚走而非钉在视口底部），几乎都是
@@ -7329,17 +7311,24 @@ def _branch_order_browse() -> None:
 
 
 # ----- Mode 2: review cart, edit, then send -------------------------------
-def _branch_order_confirm() -> None:
-    render_page_heading(f"📝 {t('review_title')}")
+def page_branch_cart() -> None:
+    """独立的购物车页面：显示已挑选的商品列表，可编辑数量/删除/去结算；
+    没有挑选任何商品时显示「购物车为空」，而不是跳回产品列表。"""
+    is_en = st.session_state.get("lang") == "en"
+    render_page_heading("🛒 " + ("Cart" if is_en else "购物车"))
     _render_active_arrival_banner()
-    st.caption(t("review_subtitle"))
 
     cart = st.session_state.cart
     if not cart:
-        # Edge case: cart got emptied while in confirm mode → bounce back
-        st.session_state["confirming"] = False
-        st.rerun()
+        st.info(t("empty_cart"))
+        if st.button(
+            "🛍️ " + ("Go shopping" if is_en else "去下单选购"),
+            use_container_width=True, type="primary", key="cart_empty_browse",
+        ):
+            _go_branch_tab("order")
         return
+
+    st.caption(t("review_subtitle"))
 
     # Render every cart line with editable qty + delete button
     for i, item in enumerate(cart):
@@ -7385,10 +7374,12 @@ def _branch_order_confirm() -> None:
     cart[:] = [it for it in cart if it["qty_cartons"] > 0 or it["qty_pcs"] > 0]
 
     if not cart:
-        st.warning(t("empty_cart"))
-        if st.button(t("back_to_browse"), use_container_width=True):
-            st.session_state["confirming"] = False
-            st.rerun()
+        st.info(t("empty_cart"))
+        if st.button(
+            "🛍️ " + ("Go shopping" if is_en else "去下单选购"),
+            use_container_width=True, key="cart_empty_browse2",
+        ):
+            _go_branch_tab("order")
         return
 
     # Summary line
@@ -7406,8 +7397,7 @@ def _branch_order_confirm() -> None:
     with bc1:
         if st.button(t("back_to_browse"), use_container_width=True,
                      key="back_browse"):
-            st.session_state["confirming"] = False
-            st.rerun()
+            _go_branch_tab("order")
     with bc2:
         submit_busy = bool(st.session_state.get("_send_order_busy", False))
         if submit_busy:
@@ -11278,19 +11268,340 @@ def page_branch_stock() -> None:
     st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
 
 
-def render_branch() -> None:
-    render_sidebar_lang_switch()
+# =========================================================================
+# 分店端移动 App 化导航：隐藏侧边栏 + 底部固定 Tab Bar
+# =========================================================================
+def _inject_branch_mobile_css() -> None:
+    """分店端专用：隐藏原生侧边栏，主容器收窄居中(模拟手机 App)，
+    并定义底部固定 Tab 栏样式。仅在 render_branch 调用，不影响仓库/管理员端。"""
+    st.markdown(
+        """
+<style>
+/* —— 1. 隐藏一切原生 chrome：左侧栏 / 顶部装饰条+header / 右上三点菜单 —— */
+section[data-testid="stSidebar"],
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"],
+[data-testid="stHeader"],
+[data-testid="stDecoration"],
+[data-testid="stToolbar"],
+[data-testid="stMainMenu"],
+[data-testid="stStatusWidget"],
+#MainMenu,
+header[data-testid="stHeader"] { display: none !important; }
 
-    st.sidebar.markdown(
-        (
-            "<div class='branch-identity'>"
-            f"<div class='k'>{html.escape(t('current_branch'))}</div>"
-            f"<div class='v'>{html.escape(st.session_state.branch)}</div>"
-            "</div>"
-        ),
+/* —— 2. 主容器收窄居中：手机/PC 都呈现精致的 App 宽度（550px）—— */
+section[data-testid="stMain"] .block-container,
+.block-container {
+    max-width: 550px !important;
+    margin: 0 auto !important;
+    padding-top: 2rem !important;
+    /* 4. 防遮挡：底部预留空白，最后一行内容也能滑上来点到 */
+    padding-bottom: 90px !important;
+}
+
+/* —— 关键：清除主内容祖先链上的"包含块"属性 ——
+   position:fixed 只要有任一祖先带 transform/filter/will-change/perspective/
+   contain，就会退化成相对该祖先定位（看起来随页面滚动）。这里静态地把所有
+   可能的祖先容器中和掉，让 Tab 栏真正相对【视口】固定。注意：只中和祖先级
+   容器(stVerticalBlock 等)，不碰 Tab 栏自身的包裹层(它在 PC 端要用 translateX)。 */
+.stApp,
+[data-testid="stApp"],
+.stMain,
+[data-testid="stAppViewContainer"],
+section[data-testid="stMain"],
+section[data-testid="stMain"] > div,
+.main,
+[data-testid="stMainBlockContainer"],
+section[data-testid="stMain"] .block-container,
+section[data-testid="stMain"] [data-testid="stVerticalBlock"] {
+    transform: none !important;
+    filter: none !important;
+    backdrop-filter: none !important;
+    perspective: none !important;
+    will-change: auto !important;
+    contain: none !important;
+}
+
+/* —— 3. 真实路由按钮容器：移到屏幕外（仍在 #root 内，JS .click() 可代理触发，
+       用户看不到；可见底栏由 JS 注入到 <body> 根节点，见 render_branch_bottom_nav）—— */
+.st-key-branch_tabbar {
+    position: absolute !important;
+    left: -99999px !important;
+    top: 0 !important;
+    width: 1px !important;
+    height: 1px !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+</style>
+        """,
         unsafe_allow_html=True,
     )
-    st.sidebar.divider()
+
+
+def _go_branch_tab(page_key: str) -> None:
+    """底部 Tab / 更多页跳转：切换 page、同步 URL 与 cookie，并 rerun。"""
+    st.session_state.page = page_key
+    st.session_state._nav_from_sidebar = True
+    try:
+        st.query_params[URL_PAGE_QUERY_KEY] = page_key
+    except Exception:
+        pass
+    try:
+        import auth as sunshine_auth
+
+        sunshine_auth.touch_cookie_page(page_key)
+    except Exception:
+        pass
+    st.session_state["confirming"] = False
+    st.rerun()
+
+
+def _go_branch_cart() -> None:
+    """购物车 Tab：先把暂存(已填未追加)的数量并入购物车，再进入独立购物车页。"""
+    try:
+        pending = _collect_qty_inputs()
+        for item in pending:
+            st.session_state.cart.append(_enrich_cart_item(item))
+        if pending:
+            _clear_qty_inputs()
+    except Exception as e:
+        log_exception("go_branch_cart_merge_pending", e)
+    st.session_state.page = "cart"
+    st.session_state["confirming"] = False
+    st.session_state._nav_from_sidebar = True
+    try:
+        st.query_params[URL_PAGE_QUERY_KEY] = "cart"
+    except Exception:
+        pass
+    try:
+        import auth as sunshine_auth
+
+        sunshine_auth.touch_cookie_page("cart")
+    except Exception:
+        pass
+    st.rerun()
+
+
+def _inject_branch_fixed_fix_js() -> None:
+    """让底部 Tab 栏(和顶部购物车)的 position:fixed 真正相对视口生效。
+
+    Streamlit 某些祖先容器带 transform/filter/backdrop-filter 等属性会把 fixed
+    退化为相对祖先定位。这里从标记元素向上遍历到 body，清除这些"包含块"属性。"""
+    components.html(
+        """
+<script>
+(function () {
+  const doc = window.parent.document;
+  const win = doc.defaultView;
+  const MARKS = ['.branch-tabbar-marker', '.sunshine-cart-summary'];
+  function neutralize() {
+    MARKS.forEach(function (sel) {
+      const m = doc.querySelector(sel);
+      if (!m) return;
+      const box = m.closest('[data-testid="stVerticalBlockBorderWrapper"]');
+      if (!box) return;
+      let p = box.parentElement;
+      while (p && p !== doc.body && p.nodeType === 1) {
+        const s = win.getComputedStyle(p);
+        const wc = s.willChange || '';
+        if (s.transform !== 'none' || s.filter !== 'none' ||
+            (s.backdropFilter && s.backdropFilter !== 'none') ||
+            s.perspective !== 'none' || wc.indexOf('transform') !== -1 ||
+            (s.contain && s.contain !== 'none' && s.contain !== 'normal')) {
+          p.style.setProperty('transform', 'none', 'important');
+          p.style.setProperty('filter', 'none', 'important');
+          p.style.setProperty('backdrop-filter', 'none', 'important');
+          p.style.setProperty('perspective', 'none', 'important');
+          p.style.setProperty('will-change', 'auto', 'important');
+          p.style.setProperty('contain', 'none', 'important');
+        }
+        p = p.parentElement;
+      }
+    });
+  }
+  neutralize();
+  try {
+    new MutationObserver(neutralize).observe(doc.body, { childList: true, subtree: true });
+  } catch (e) {}
+})();
+</script>
+        """,
+        height=0,
+    )
+
+
+_BRANCH_TABBAR_JS = r"""
+<script>
+(function () {
+  var doc = window.parent.document;
+  var TABS = __TABS_JSON__;
+  var BAR_ID = "branch-fixed-tabbar";
+  var STYLE_ID = "branch-fixed-tabbar-style";
+
+  // 1) 注入一次性样式到 parent <head>
+  if (!doc.getElementById(STYLE_ID)) {
+    var st = doc.createElement("style");
+    st.id = STYLE_ID;
+    st.textContent =
+      "#" + BAR_ID + "{position:fixed;left:0;right:0;bottom:0;z-index:2147483600;" +
+      "display:flex;background:#fff;border-top:1px solid #e8edf5;" +
+      "box-shadow:0 -6px 22px rgba(15,23,42,.10);" +
+      "padding:6px 4px calc(6px + env(safe-area-inset-bottom,0px));" +
+      "font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;}" +
+      "@media(min-width:560px){#" + BAR_ID + "{left:50%;right:auto;transform:translateX(-50%);" +
+      "width:550px;border-radius:18px 18px 0 0;border-left:1px solid #e8edf5;border-right:1px solid #e8edf5;}}" +
+      "#" + BAR_ID + " .bft-tab{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;" +
+      "padding:4px 0;cursor:pointer;color:#7b879c;font-weight:600;user-select:none;" +
+      "-webkit-tap-highlight-color:transparent;transition:color .15s ease;}" +
+      "#" + BAR_ID + " .bft-tab .bft-ico{font-size:1.4rem;line-height:1;}" +
+      "#" + BAR_ID + " .bft-tab .bft-lbl{font-size:.72rem;}" +
+      "#" + BAR_ID + " .bft-tab.active{color:#2563eb;}" +
+      "#" + BAR_ID + " .bft-tab.active .bft-lbl{font-weight:800;}" +
+      "#" + BAR_ID + " .bft-tab:active{background:rgba(37,99,235,.10);border-radius:12px;}";
+    doc.head.appendChild(st);
+  }
+
+  function build() {
+    // 只在分店端（隐藏的真实按钮容器存在）才显示底栏
+    var anchor = doc.querySelector(".st-key-branch_tabbar");
+    var old = doc.getElementById(BAR_ID);
+    if (!anchor) { if (old) old.remove(); return; }
+    if (old) old.remove();
+
+    var bar = doc.createElement("div");
+    bar.id = BAR_ID;
+    TABS.forEach(function (tb) {
+      var el = doc.createElement("div");
+      el.className = "bft-tab" + (tb.active ? " active" : "");
+      el.innerHTML =
+        '<div class="bft-ico">' + tb.icon + '</div>' +
+        '<div class="bft-lbl">' + tb.label + '</div>';
+      el.addEventListener("click", function () {
+        // 代理点击对应的隐藏真实 st.button → 触发 Streamlit 原生 rerun（不刷新整页）
+        var btn = doc.querySelector(".st-key-btab_" + tb.key + " button");
+        if (btn) { btn.click(); }
+      });
+      bar.appendChild(el);
+    });
+    doc.body.appendChild(bar);
+  }
+
+  build();
+  // 持续兜底：DOM 变化（rerun/导航）后保持底栏存在、离开分店端时自动移除
+  try {
+    new MutationObserver(function () {
+      if (!doc.getElementById(BAR_ID) || !doc.querySelector(".st-key-branch_tabbar")) {
+        build();
+      }
+    }).observe(doc.body, { childList: true, subtree: true });
+  } catch (e) {}
+})();
+</script>
+"""
+
+
+def render_branch_bottom_nav(nav_items: list[tuple[str, str]]) -> None:
+    """终极方案：纯 HTML 底栏经 JS 注入 <body> 根节点（彻底逃离任何 transform 祖先，
+    保证相对【视口】固定）；真实 st.button 隐藏在 #root 内负责原生路由，
+    可见底栏点击时由 JS 代理触发对应隐藏按钮，既绝对吸底又无整页刷新。"""
+    page = st.session_state.get("page", "order")
+    perm_keys = {k for k, _ in nav_items}
+    is_en = st.session_state.get("lang") == "en"
+
+    def lbl(zh: str, en: str) -> str:
+        return en if is_en else zh
+
+    tabs: list[tuple[str, str, str]] = []
+    if "order" in perm_keys:
+        tabs.append(("order", "🛍️", lbl("下单", "Order")))
+    if "my_orders" in perm_keys:
+        tabs.append(("my_orders", "📋", lbl("订单", "Orders")))
+    if "order" in perm_keys:           # 购物车随「下单」权限开放
+        tabs.append(("cart", "🛒", lbl("购物车", "Cart")))
+    if "stock" in perm_keys:
+        tabs.append(("stock", "📦", lbl("库存", "Stock")))
+    tabs.append(("more", "☰", lbl("更多", "More")))
+
+    # 当前页 → 高亮哪个 Tab
+    active = {
+        "order": "order", "order_done": "order",
+        "cart": "cart",
+        "my_orders": "my_orders", "stock": "stock",
+        "messages": "more", "ai": "more", "more": "more", "my_short": "more",
+    }.get(page, "order")
+
+    # 1) 隐藏的真实 st.button（在 #root 内，JS .click() 代理触发，原生路由不刷新）
+    with st.container(key="branch_tabbar"):
+        for key, icon, text in tabs:
+            if st.button(f"{icon} {text}", key=f"btab_{key}",
+                         use_container_width=True):
+                if key == "cart":
+                    _go_branch_cart()
+                else:
+                    _go_branch_tab(key)
+
+    # 2) 可见底栏：纯 HTML + CSS，经 JS 搬到 <body>，绝对相对视口固定
+    tabs_json = json.dumps(
+        [{"key": k, "icon": i, "label": l, "active": (k == active)}
+         for k, i, l in tabs],
+        ensure_ascii=False,
+    )
+    components.html(
+        _BRANCH_TABBAR_JS.replace("__TABS_JSON__", tabs_json),
+        height=0,
+    )
+
+
+def page_branch_more() -> None:
+    """「更多」页：分店身份 + 消息中心 + AI 助手 + 语言切换 + 退出登录。"""
+    is_en = st.session_state.get("lang") == "en"
+    render_page_heading("☰ " + ("More" if is_en else "更多"))
+
+    st.markdown(
+        "<div class='branch-identity'>"
+        f"<div class='k'>{html.escape(t('current_branch'))}</div>"
+        f"<div class='v'>{html.escape(st.session_state.get('branch', '') or '')}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
+    if has_branch_perm("my_short"):
+        if st.button(t("nav_my_short"), use_container_width=True,
+                     key="more_my_short"):
+            _go_branch_tab("my_short")
+    if has_branch_perm("messages"):
+        if st.button(_nav_messages_label(), use_container_width=True,
+                     key="more_messages"):
+            _go_branch_tab("messages")
+    if has_branch_perm("ai"):
+        if st.button(t("nav_ai"), use_container_width=True, key="more_ai"):
+            _go_branch_tab("ai")
+
+    st.divider()
+    st.caption("🌐 " + ("Language" if is_en else "语言"))
+    lc1, lc2 = st.columns(2)
+    with lc1:
+        if st.button("🇬🇧 English", use_container_width=True,
+                     type="primary" if is_en else "secondary",
+                     key="more_lang_en"):
+            st.session_state.lang = "en"
+            st.rerun()
+    with lc2:
+        if st.button("🇨🇳 中文", use_container_width=True,
+                     type="primary" if not is_en else "secondary",
+                     key="more_lang_zh"):
+            st.session_state.lang = "zh"
+            st.rerun()
+
+    st.divider()
+    logout_button("logout_branch_more")
+
+
+def render_branch() -> None:
+    _inject_branch_mobile_css()
 
     full_nav = [
         ("order", t("nav_order"), "order"),
@@ -11308,18 +11619,12 @@ def render_branch() -> None:
     # 库存/临期页对所有分店账号开放（不依赖逐个授权）。
     nav_items.append(("stock", t("nav_stock")))
 
-    allowed = _branch_nav_allowed_keys(nav_items)
+    allowed = _branch_nav_allowed_keys(nav_items) | {"more", "cart"}
     _apply_url_page_to_session(Role.BRANCH, allowed)
 
     ensure_branch_page_allowed(st.session_state.get("page") or nav_items[0][0])
 
     _hydrate_branch_cart_if_needed()
-
-    _render_sidebar_nav(nav_items)
-    st.sidebar.divider()
-    with st.sidebar:
-        logout_button("logout_branch")
-    _render_active_page_hint(nav_items)
 
     pages = {
         "order":     page_branch_order,
@@ -11329,8 +11634,14 @@ def render_branch() -> None:
         "messages":  page_messages,
         "ai":        page_ai_assistant,
         "stock":     page_branch_stock,
+        "cart":      page_branch_cart,
+        "more":      page_branch_more,
     }
     pages.get(st.session_state.page, page_branch_order)()
+
+    # 底部固定 Tab 栏（最后渲染，CSS 固定吸底，不随内容滚动）
+    render_branch_bottom_nav(nav_items)
+
     _sync_cookie_default_page(st.session_state.page)
     _persist_branch_cart()
 
